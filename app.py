@@ -122,7 +122,7 @@ st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
 st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
 st.markdown("Basado en baremo legal y método de densidad de ocupación por octantes.")
 
-modo_evaluacion = st.radio("Seleccione el tipo de evaluación:", ["Unilateral (Un solo ojo)", "Bilateral (Ambos ojos)"], key="radio_modo")
+modo_evaluacion = st.radio("Seleccione el tipo de evaluación:", ["Unilateral (Un solo ojo)", "Bilateral (Ambos ojos)"], key="radio_modo") # Solucion error key
 col1, col2 = st.columns(2)
 
 incap_OD = 0.0
