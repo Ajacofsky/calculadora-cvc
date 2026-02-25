@@ -2,13 +2,13 @@ import streamlit as st
 import cv2
 import numpy as np
 import math
+from PIL import Image # <-- NUEVA LIBRERÍA IMPORTADA AQUÍ
 
 # ==========================================
 # 1. MOTOR DE VISIÓN COMPUTARIZADA Y LÓGICA
 # ==========================================
 
 def procesar_campo_visual(image_bytes):
-    # Verificación de seguridad para Streamlit Cloud
     if not image_bytes:
         return None, 0, 0
 
@@ -26,7 +26,6 @@ def procesar_campo_visual(image_bytes):
     alto, ancho = gray.shape
     cx, cy = int(ancho / 2), int(alto / 2) 
     
-    # Estimación de la marca de 60 grados (ajustado a las imágenes subidas)
     distancia_60_grados = int((ancho - cx) * 0.8) 
     pixels_por_10_grados = distancia_60_grados / 6.0
     
@@ -40,18 +39,14 @@ def procesar_campo_visual(image_bytes):
         x, y, w, h = cv2.boundingRect(cnt)
         area_caja = w * h
         
-        # Filtrar por tamaño para ignorar texto y ejes (ajustado a los CVC de Humphrey)
         if 15 < area_caja < 250:
-            # Nuevo método de OCR: Densidad de píxeles reales
             roi = thresh[y:y+h, x:x+w]
             pixeles_activos = cv2.countNonZero(roi)
             densidad_forma = pixeles_activos / float(area_caja)
             
-            # Centroide exacto
             px = x + (w // 2)
             py = y + (h // 2)
             
-            # Coordenadas polares
             dx, dy = px - cx, py - cy
             radio_pixel = math.sqrt(dx**2 + dy**2)
             grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
@@ -60,7 +55,7 @@ def procesar_campo_visual(image_bytes):
             if angulo < 0: angulo += 360
             
             if grados_fisicos <= 40:
-                # El cuadrado ■ es macizo (densidad > 0.6). El círculo ○ es hueco.
+                # Cuadrado macizo > 0.6 densidad, círculo hueco < 0.6
                 tipo = 'fallado' if densidad_forma > 0.6 else 'visto'
                 puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
 
@@ -92,10 +87,10 @@ def procesar_campo_visual(image_bytes):
                 
                 if densidad >= 70:
                     grados_perdidos = 10
-                    color_zona = (255, 200, 0) # Celeste
+                    color_zona = (255, 200, 0) # Celeste en BGR
                 elif 0 < densidad < 70:
                     grados_perdidos = 5
-                    color_zona = (0, 255, 255) # Amarillo
+                    color_zona = (0, 255, 255) # Amarillo en BGR
             
             grados_no_vistos_total += grados_perdidos
             
@@ -139,12 +134,14 @@ with col1:
     file_od = st.file_uploader("Subir imagen CVC Ojo Derecho", type=["jpg", "jpeg", "png"])
     if file_od is not None:
         st.info("Procesando imagen...")
-        # Usamos getvalue() para proteger el buffer en la nube
         img_res_od, grados_od, incap_OD = procesar_campo_visual(file_od.getvalue())
         
         if img_res_od is not None:
-            # Quitamos cvtColor y usamos channels="BGR" nativo de Streamlit
-            st.image(img_res_od, channels="BGR", caption="Mapa de Calor Generado - OD", use_container_width=True)
+            # --- SOLUCIÓN A PRUEBA DE FALLOS: CONVERSIÓN A PIL ---
+            img_rgb_od = cv2.cvtColor(img_res_od, cv2.COLOR_BGR2RGB)
+            pil_img_od = Image.fromarray(img_rgb_od)
+            
+            st.image(pil_img_od, caption="Mapa de Calor Generado - OD", use_container_width=True)
             st.success(f"**Grados No Vistos:** {grados_od}° / 320°")
             st.success(f"**Incapacidad OD:** {incap_OD:.2f}%")
         else:
@@ -159,7 +156,11 @@ with col2:
             img_res_oi, grados_oi, incap_OI = procesar_campo_visual(file_oi.getvalue())
             
             if img_res_oi is not None:
-                st.image(img_res_oi, channels="BGR", caption="Mapa de Calor Generado - OI", use_container_width=True)
+                # --- SOLUCIÓN A PRUEBA DE FALLOS: CONVERSIÓN A PIL ---
+                img_rgb_oi = cv2.cvtColor(img_res_oi, cv2.COLOR_BGR2RGB)
+                pil_img_oi = Image.fromarray(img_rgb_oi)
+                
+                st.image(pil_img_oi, caption="Mapa de Calor Generado - OI", use_container_width=True)
                 st.success(f"**Grados No Vistos:** {grados_oi}° / 320°")
                 st.success(f"**Incapacidad OI:** {incap_OI:.2f}%")
             else:
