@@ -22,11 +22,11 @@ def procesar_campo_visual(image_bytes):
     overlay = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Binarización inicial (Invertida: lo negro se vuelve blanco)
-    _, thresh = cv2.threshold(gray, 130, 255, cv2.THRESH_BINARY_INV)
+    # Binarización invertida (lo negro pasa a ser blanco)
+    _, thresh = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY_INV)
     alto, ancho = gray.shape
     
-    # --- A. CALIBRACIÓN GEOMÉTRICA (DETECCIÓN INTELIGENTE DE EJES) ---
+    # --- A. CALIBRACIÓN GEOMÉTRICA (DETECCIÓN DE EJES) ---
     kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho * 0.15), 1))
     lineas_h = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h)
     
@@ -53,7 +53,14 @@ def procesar_campo_visual(image_bytes):
         
     pixels_por_10_grados = distancia_60_grados / 6.0
     
-    # --- B. DETECCIÓN DE PUNTOS (OCR DE SÍMBOLOS AVANZADO) ---
+    # --- B. DETECCIÓN DE PUNTOS (EROSIÓN INFALIBLE) ---
+    
+    # 1. Aplicamos "Erosión": Solo sobreviven los bloques gruesos (los ■). Las líneas finas y círculos mueren.
+    kernel_size = max(3, int(pixels_por_10_grados * 0.05)) # Se adapta a la resolución de tu imagen
+    kernel_sq = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    thresh_eroded = cv2.erode(thresh, kernel_sq, iterations=1)
+    
+    # 2. Buscamos todas las marcas (■ y ○) usando un filtro relajado para que las cruces de fondo no estorben
     contornos, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     puntos_totales = []
     
@@ -62,41 +69,31 @@ def procesar_campo_visual(image_bytes):
         area_caja = w * h
         aspect_ratio = float(w)/h if h > 0 else 0
         
-        # Filtrar por tamaño y proporción geométrica (evita ruido y líneas largas)
-        if 10 < area_caja < 400 and 0.6 < aspect_ratio < 1.6:
-            roi = thresh[y:y+h, x:x+w]
-            
-            # ANÁLISIS DEL PARCHE CENTRAL
-            cy_box = h // 2
-            cx_box = w // 2
-            
-            # Recortamos un parche de 3x3 en el medio del símbolo
-            y_start = max(0, cy_box-1)
-            y_end = min(h, cy_box+2)
-            x_start = max(0, cx_box-1)
-            x_end = min(w, cx_box+2)
-            
-            parche_central = roi[y_start:y_end, x_start:x_end]
-            pixeles_centro_activos = cv2.countNonZero(parche_central)
-            area_parche = (y_end - y_start) * (x_end - x_start)
-            
-            # Coordenadas matemáticas polares
+        # Filtro de tamaño muy generoso (10 a 2000 px) para asegurar que no se nos escape nada
+        if 10 < area_caja < 2000 and 0.2 < aspect_ratio < 4.0:
             px = x + (w // 2)
             py = y + (h // 2)
+            
             dx, dy = px - cx, py - cy
             radio_pixel = math.sqrt(dx**2 + dy**2)
             grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
             
-            # Ángulo (0 grados está a la derecha, horario)
-            angulo = math.degrees(math.atan2(dy, dx))
-            if angulo < 0: angulo += 360
-            
-            if grados_fisicos <= 40:
-                # Si el centro está macizo (blanco en thresh), es un cuadrado ■
-                if area_parche > 0 and (pixeles_centro_activos / area_parche) > 0.4:
+            # Solo evaluamos lo que está entre 2° y 41° (ignorando el texto del marco y la cruz central)
+            if 2 < grados_fisicos <= 41:
+                angulo = math.degrees(math.atan2(dy, dx))
+                if angulo < 0: angulo += 360
+                
+                # PRUEBA DE ORO: ¿El centro matemático de este punto sobrevivió a la erosión?
+                ventana = thresh_eroded[max(0, py-2):min(alto, py+2), max(0, px-2):min(ancho, px+2)]
+                
+                if cv2.countNonZero(ventana) > 0:
                     tipo = 'fallado'
+                    # DIBUJAMOS PUNTITO ROJO DE AUDITORÍA (para que veas que sí lo detectó)
+                    cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) 
                 else:
-                    tipo = 'visto' # Centro vacío = Círculo ○
+                    tipo = 'visto'
+                    # DIBUJAMOS PUNTITO VERDE DE AUDITORÍA
+                    cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1)
                     
                 puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
 
@@ -153,7 +150,6 @@ def procesar_campo_visual(image_bytes):
     incapacidad_ojo = porcentaje_perdida_cv * 0.25
 
     return img_heatmap, grados_no_vistos_total, incapacidad_ojo
-
 # ==========================================
 # 2. INTERFAZ DE USUARIO (WEB APP)
 # ==========================================
