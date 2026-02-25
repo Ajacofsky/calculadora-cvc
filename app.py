@@ -22,17 +22,43 @@ def procesar_campo_visual(image_bytes):
     overlay = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # --- A. CALIBRACIÓN GEOMÉTRICA ---
+    # Binarización inicial
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
     alto, ancho = gray.shape
-    cx, cy = int(ancho / 2), int(alto / 2) 
     
-    distancia_60_grados = int((ancho - cx) * 0.8) 
+    # --- A. CALIBRACIÓN GEOMÉTRICA (DETECCIÓN INTELIGENTE DE EJES) ---
+    
+    # 1. Aislar líneas largas para encontrar la cruz central real
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho * 0.15), 1))
+    lineas_h = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h)
+    
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(alto * 0.15)))
+    lineas_v = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_v)
+    
+    # Encontrar la intersección exacta de los ejes
+    interseccion = cv2.bitwise_and(lineas_h, lineas_v)
+    y_coords, x_coords = np.where(interseccion > 0)
+    
+    if len(x_coords) > 0 and len(y_coords) > 0:
+        cx = int(np.mean(x_coords))
+        cy = int(np.mean(y_coords))
+    else:
+        cx, cy = int(ancho / 2), int(alto / 2) # Fallback de seguridad
+        
+    # 2. Calcular la escala precisa (60 grados) midiendo el eje horizontal detectado
+    fila_eje_h = lineas_h[cy-10 : cy+10, :] # Banda de búsqueda alrededor del centro Y
+    _, x_h = np.where(fila_eje_h > 0)
+    
+    if len(x_h) > 0:
+        extremo_derecho = np.max(x_h)
+        distancia_60_grados = extremo_derecho - cx
+    else:
+        distancia_60_grados = int((ancho - cx) * 0.75) # Fallback
+        
     pixels_por_10_grados = distancia_60_grados / 6.0
     
     # --- B. DETECCIÓN DE PUNTOS (SÍMBOLOS) ---
-    _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
     contornos, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
     puntos_totales = []
     
     for cnt in contornos:
@@ -55,13 +81,13 @@ def procesar_campo_visual(image_bytes):
             if angulo < 0: angulo += 360
             
             if grados_fisicos <= 40:
-                # Cuadrado macizo > 0.6 densidad, círculo hueco < 0.6
                 tipo = 'fallado' if densidad_forma > 0.6 else 'visto'
                 puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
 
     # --- C. ANÁLISIS POR ZONAS (Densidad) ---
     grados_no_vistos_total = 0
     
+    # Dibujar anillos concéntricos
     for i in range(1, 5):
         radio_dibujo = int(i * pixels_por_10_grados)
         cv2.circle(img_heatmap, (cx, cy), radio_dibujo, (0, 0, 255), 1)
@@ -87,10 +113,10 @@ def procesar_campo_visual(image_bytes):
                 
                 if densidad >= 70:
                     grados_perdidos = 10
-                    color_zona = (255, 200, 0) # Celeste en BGR
+                    color_zona = (255, 200, 0) # Celeste
                 elif 0 < densidad < 70:
                     grados_perdidos = 5
-                    color_zona = (0, 255, 255) # Amarillo en BGR
+                    color_zona = (0, 255, 255) # Amarillo
             
             grados_no_vistos_total += grados_perdidos
             
@@ -102,6 +128,7 @@ def procesar_campo_visual(image_bytes):
 
     cv2.addWeighted(overlay, 0.4, img_heatmap, 0.6, 0, img_heatmap)
     
+    # Dibujar bisectrices y ejes
     for angulo_linea in range(0, 360, 45):
         rad = math.radians(angulo_linea)
         x2 = int(cx + (4 * pixels_por_10_grados) * math.cos(rad))
