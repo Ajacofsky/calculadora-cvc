@@ -29,15 +29,13 @@ def procesar_campo_visual(image_bytes):
         
         # 2. CENTRO Y ESCALA (MÉTODO ORO: Cruce Morfológico)
         mask_ejes = thresh.copy()
-        mask_ejes[int(alto*0.75):, :] = 0 # Ocultar tabla inferior de grises
+        mask_ejes[int(alto*0.75):, :] = 0 # Ocultar tabla inferior
         
-        # Buscar líneas largas ininterrumpidas (la cruz central)
         kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho*0.15), 1))
         kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(alto*0.15)))
         lineas_h = cv2.morphologyEx(mask_ejes, cv2.MORPH_OPEN, kernel_h)
         lineas_v = cv2.morphologyEx(mask_ejes, cv2.MORPH_OPEN, kernel_v)
         
-        # Intersección de la cruz = Centro absoluto
         inter = cv2.bitwise_and(lineas_h, lineas_v)
         y_coords, x_coords = np.where(inter > 0)
         
@@ -46,17 +44,18 @@ def procesar_campo_visual(image_bytes):
         else:
             cx, cy = ancho//2, alto//2
             
-        # Escala: Medimos el brazo derecho de la cruz horizontal
         eje_derecho = lineas_h[cy-5:cy+5, cx:]
         _, x_h = np.where(eje_derecho > 0)
         dist_60 = np.max(x_h) if len(x_h) > 0 else (ancho - cx)*0.75
         pixels_por_10_grados = float(dist_60 / 6.0)
 
+        # MAGIA NUEVA: Margen para ignorar las marcas de la regla (Ticks)
+        margen_eje = pixels_por_10_grados * 0.15
+
         # 3. DETECCIÓN (MÉTODO ORO: Núcleo del 40%)
         grilla = cv2.bitwise_or(lineas_h, lineas_v)
         grilla_dilatada = cv2.dilate(grilla, np.ones((3,3), np.uint8))
         
-        # Usar mask_ejes para no detectar las letras de abajo por accidente
         simbolos_aislados = cv2.subtract(mask_ejes, grilla_dilatada)
         simbolos_aislados = cv2.morphologyEx(simbolos_aislados, cv2.MORPH_OPEN, np.ones((2,2), np.uint8))
         
@@ -69,8 +68,12 @@ def procesar_campo_visual(image_bytes):
             x, y, w, h = cv2.boundingRect(cnt)
             if area_min < w*h < area_max and 0.4 < w/float(h) < 2.5:
                 px, py = x + w//2, y + h//2
+                dx, dy = px - cx, py - cy
                 
-                # Muestreo del núcleo central
+                # FILTRO FANTASMA: Si toca la cruz, lo ignoramos (es una marca o la mancha ciega)
+                if abs(dx) < margen_eje or abs(dy) < margen_eje:
+                    continue
+                
                 roi = thresh[y:y+h, x:x+w]
                 y1, y2 = int(h*0.3), int(h*0.7)
                 x1, x2 = int(w*0.3), int(w*0.7)
@@ -80,12 +83,11 @@ def procesar_campo_visual(image_bytes):
                     densidad_tinta = cv2.countNonZero(corazon) / float(corazon.size)
                     tipo = 'fallado' if densidad_tinta > 0.45 else 'visto'
                     
-                    dx, dy = px - cx, py - cy
                     r_deg = (math.hypot(dx, dy) / pixels_por_10_grados) * 10.0
                     
-                    # FILTRO DE ORO: Solo consideramos lo que está entre 2 y 41 grados
                     if 2 <= r_deg <= 41:
-                        ang = (math.degrees(math.atan2(dy, dx)) + 360) % 360
+                        # Sumamos 0.001 para que los puntos en diagonal no cambien de octante al azar
+                        ang = (math.degrees(math.atan2(dy, dx)) + 360.001) % 360
                         anillo = min(3, int(r_deg // 10))
                         octante = min(7, int(ang // 45))
                         
@@ -113,10 +115,10 @@ def procesar_campo_visual(image_bytes):
                     pct = (f / float(f + v)) * 100
                     color = None
                     if pct >= 70:
-                        color = (255, 200, 0) # Celeste BGR
+                        color = (255, 200, 0) # Celeste
                         grados_no_vistos += 10
                     elif pct > 0:
-                        color = (0, 255, 255) # Amarillo BGR
+                        color = (0, 255, 255) # Amarillo
                         grados_no_vistos += 5
                         
                     if color:
@@ -155,7 +157,7 @@ def procesar_campo_visual(image_bytes):
 
 st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
 st.markdown("""
-**Programa Activo:** Motor Original de Detección (Núcleo) + Grilla Geométrica Fija.
+**Programa Activo:** Motor Original + Grilla Fija + **Filtro Anti-Marcas**.
 - **Puntos Rojos:** Cuadrados (Fallados).
 - **Puntos Verdes:** Círculos (Vistos).
 - **Celeste:** Densidad ≥ 70% (10°). **Amarillo:** > 0% (5°).
