@@ -8,7 +8,7 @@ import traceback
 st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
 
 # ==========================================
-# MOTOR DE VISIÓN COMPUTARIZADA (VERSIÓN 4.0)
+# MOTOR DE VISIÓN COMPUTARIZADA (ANCLAJE EXTREMO)
 # ==========================================
 
 def procesar_campo_visual(image_bytes):
@@ -23,7 +23,6 @@ def procesar_campo_visual(image_bytes):
             return None, 0, 0, "Formato de imagen inválido."
 
         img_heatmap = img.copy()
-        overlay = np.zeros_like(img, dtype=np.uint8)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         alto, ancho = gray.shape
         
@@ -31,13 +30,13 @@ def procesar_campo_visual(image_bytes):
         gray_contrast = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
         thresh = cv2.adaptiveThreshold(gray_contrast, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 12)
         
-        # --- A. ENCONTRAR EL CENTRO EXACTO ---
+        # --- A. ENCONTRAR EL CENTRO EXACTO (CRUZ DE EJES) ---
         roi_y = thresh[int(alto*0.3):int(alto*0.7), :]
         cy = np.argmax(np.sum(roi_y, axis=1)) + int(alto*0.3)
         roi_x = thresh[:, int(ancho*0.3):int(ancho*0.7)]
         cx = np.argmax(np.sum(roi_x, axis=0)) + int(ancho*0.3)
 
-        # --- B. DETECCIÓN DE SÍMBOLOS (Motor de Núcleo Conservado) ---
+        # --- B. DETECCIÓN DE SÍMBOLOS (Motor Núcleo) ---
         kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho*0.05), 1))
         kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(alto*0.05)))
         lineas_h = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h)
@@ -69,47 +68,27 @@ def procesar_campo_visual(image_bytes):
                 
                 if y2 > y1 and x2 > x1:
                     corazon = thresh[y+y1:y+y2, x+x1:x+x2]
-                    # CORRECCIÓN ACTIVA: cv2.countNonZero (Sin error de librería)
                     densidad_tinta = cv2.countNonZero(corazon) / float(corazon.size)
                     
                     tipo = 'fallado' if densidad_tinta > 0.45 else 'visto'
                     simbolos_validos.append({'px': px, 'py': py, 'tipo': tipo})
 
-        # --- C. CALIBRACIÓN DE ESCALA INFALIBLE (Marcas de Eje / Extremo) ---
-        pixels_por_10_grados = float(ancho * 0.05) # Valor por defecto de seguridad
+        # --- C. CALIBRACIÓN DE ESCALA POR ANCLAJE FÍSICO (¡El Arreglo Definitivo!) ---
+        # Buscamos los símbolos que están sobre la línea horizontal central
+        simbolos_horizontales = [s for s in simbolos_validos if abs(s['py'] - cy) < (alto * 0.04)]
         
-        # Estrategia 1: Detectar las marcas de regla (Ticks) de 10° en el eje horizontal
-        roi_axis = thresh[max(0, cy-8):min(alto, cy+8), min(ancho, cx+int(ancho*0.05)):ancho]
-        kernel_tick = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 6))
-        ticks_img = cv2.morphologyEx(roi_axis, cv2.MORPH_OPEN, kernel_tick)
-        profile = np.sum(ticks_img, axis=0)
-        
-        peak_cols = np.where(profile > 255 * 2)[0]
-        peaks = []
-        if len(peak_cols) > 0:
-            curr = [peak_cols[0]]
-            for col in peak_cols[1:]:
-                if col <= curr[-1] + 5: # Agrupar píxeles cercanos del mismo tick
-                    curr.append(col)
-                else:
-                    peaks.append(int(np.mean(curr)))
-                    curr = [col]
-            peaks.append(int(np.mean(curr)))
-            
-        diffs = [peaks[i] - peaks[i-1] for i in range(1, len(peaks))]
-        valid_diffs = [d for d in diffs if d > ancho * 0.02]
-        
-        if len(valid_diffs) >= 2:
-            # Encontramos la regla impresa: la mediana de distancia es exactamente 10 grados
-            pixels_por_10_grados = float(np.median(valid_diffs))
-        elif len(simbolos_validos) > 10:
-            # Estrategia 2: Si no hay regla clara, el campo 120 termina en 60 grados.
-            radii = [math.hypot(s['px'] - cx, s['py'] - cy) for s in simbolos_validos]
-            # Tomamos el 98% más lejano para ignorar basuritas en el borde
-            radio_60_grados = np.percentile(radii, 98)
-            pixels_por_10_grados = float(radio_60_grados / 6.0)
+        if len(simbolos_horizontales) >= 2:
+            # Tomamos la distancia del símbolo más alejado del centro (que en el test 120 es exactamente 60°)
+            max_dist_x = max([abs(s['px'] - cx) for s in simbolos_horizontales])
+            pixels_por_10_grados = float(max_dist_x / 6.0)
+        elif len(simbolos_validos) > 0:
+            # Plan B: El punto más lejano en cualquier dirección
+            max_dist = max([math.hypot(s['px'] - cx, s['py'] - cy) for s in simbolos_validos])
+            pixels_por_10_grados = float(max_dist / 6.0)
+        else:
+            return None, 0, 0, "No se detectaron símbolos para escalar."
 
-        # --- D. FILTRADO LEGAL A 40° Y CONTEO POR SECTOR ---
+        # --- D. FILTRADO LEGAL (40 Grados) Y CONTEO ---
         puntos_zona = {anillo: {octante: {'vistos':0, 'fallados':0} for octante in range(8)} for anillo in range(4)}
         
         for sim in simbolos_validos:
@@ -130,21 +109,17 @@ def procesar_campo_visual(image_bytes):
                     puntos_zona[anillo][octante]['vistos'] += 1
                     cv2.circle(img_heatmap, (sim['px'], sim['py']), 2, (0, 255, 0), -1) # Verde
 
-        # --- E. PINTURA VECTORIAL PERFECTA DE CUADRANTES ---
-        Y, X = np.ogrid[:alto, :ancho]
-        dist_from_center = np.sqrt((X - cx)**2 + (Y - cy)**2)
-        angle_from_center = (np.degrees(np.arctan2(Y - cy, X - cx)) + 360) % 360
-        r_deg_matrix = (dist_from_center / pixels_por_10_grados) * 10.0
-
+        # --- E. PINTURA DE CAPA PERFECTA (MASKING) ---
+        mask_colores = np.zeros_like(img, dtype=np.uint8)
         grados_no_vistos_total = 0
-
+        
         for anillo in range(4):
-            r_min = anillo * 10
-            r_max = (anillo + 1) * 10
+            r_in = int(anillo * pixels_por_10_grados)
+            r_out = int((anillo + 1) * pixels_por_10_grados)
             
             for octante in range(8):
-                ang_min = octante * 45
-                ang_max = (octante + 1) * 45
+                ang_in = octante * 45
+                ang_out = (octante + 1) * 45
                 
                 f = puntos_zona[anillo][octante]['fallados']
                 v = puntos_zona[anillo][octante]['vistos']
@@ -152,23 +127,32 @@ def procesar_campo_visual(image_bytes):
                 
                 if total > 0:
                     densidad_fallo = (f / float(total)) * 100
-                    color_rgb = None
+                    color = None
                     
                     if densidad_fallo >= 70:
                         grados_no_vistos_total += 10
-                        color_rgb = (255, 200, 0) # Celeste BGR
+                        color = (255, 200, 0) # Celeste
                     elif densidad_fallo > 0:
                         grados_no_vistos_total += 5
-                        color_rgb = (0, 255, 255) # Amarillo BGR
+                        color = (0, 255, 255) # Amarillo
                         
-                    if color_rgb:
-                        # Matriz vectorial inquebrantable (sin manchas)
-                        sector_mask = (r_deg_matrix >= r_min) & (r_deg_matrix < r_max) & (angle_from_center >= ang_min) & (angle_from_center < ang_max)
-                        overlay[sector_mask] = color_rgb
+                    if color:
+                        # Dibuja la rebanada exterior llena
+                        cv2.ellipse(mask_colores, (cx, cy), (r_out, r_out), 0, ang_in, ang_out, color, -1)
+                        # Dibuja la rebanada interior negra para "ahuecar" y hacer el anillo
+                        if r_in > 0:
+                            cv2.ellipse(mask_colores, (cx, cy), (r_in, r_in), 0, ang_in, ang_out, (0, 0, 0), -1)
 
-        cv2.addWeighted(overlay, 0.4, img_heatmap, 0.6, 0, img_heatmap)
+        # Fusión de la capa de color con la imagen original
+        gray_mask = cv2.cvtColor(mask_colores, cv2.COLOR_BGR2GRAY)
+        alpha = 0.5 # Transparencia
         
-        # Dibujar Grilla Guía Final
+        for c in range(3):
+            img_heatmap[:,:,c] = np.where(gray_mask > 0, 
+                                          img_heatmap[:,:,c] * (1 - alpha) + mask_colores[:,:,c] * alpha, 
+                                          img_heatmap[:,:,c])
+        
+        # Dibujar Grilla Guía Roja
         for i in range(1, 5):
             cv2.circle(img_heatmap, (cx, cy), int(i * pixels_por_10_grados), (0, 0, 255), 1)
         for i in range(8):
@@ -190,7 +174,7 @@ def procesar_campo_visual(image_bytes):
 
 st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
 st.markdown("""
-**Arquitectura Final:** Detección de Núcleo Activa + Escala de Ticks Vectorial.
+**Arquitectura Final:** Escala de Anclaje Físico y Capa de Pintura Geométrica.
 - **Puntos Rojos:** Cuadrados (Fallados).
 - **Puntos Verdes:** Círculos (Vistos).
 - **Celeste:** Densidad ≥ 70% (10°). **Amarillo:** > 0% (5°).
@@ -205,7 +189,7 @@ def mostrar_resultado(columna, titulo, key_uploader):
         st.subheader(titulo)
         file = st.file_uploader(f"Subir imagen {titulo}", type=["jpg", "jpeg", "png"], key=key_uploader)
         if file is not None:
-            with st.spinner("Procesando matriz espacial..."):
+            with st.spinner("Mapeando octantes y escala de grises..."):
                 img_res, grados, incap, error_msg = procesar_campo_visual(file.getvalue())
             
             if error_msg:
@@ -214,7 +198,7 @@ def mostrar_resultado(columna, titulo, key_uploader):
                 return 0.0
             elif img_res is not None:
                 img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
-                st.image(Image.fromarray(img_rgb), caption=f"Mapa de Calor Clínico - {titulo}", use_container_width=True)
+                st.image(Image.fromarray(img_rgb), caption=f"Mapa de Calor - {titulo}", use_container_width=True)
                 st.success(f"**Grados No Vistos:** {grados}° / 320°")
                 st.metric(label=f"Incapacidad {titulo}", value=f"{incap:.2f}%")
                 return incap
