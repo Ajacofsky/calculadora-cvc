@@ -22,8 +22,8 @@ def procesar_campo_visual(image_bytes):
     overlay = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # --- A. CALIBRACIÓN GEOMÉTRICA (DETECCIÓN INTELIGENTE DE EJES) ---
-    _, thresh_ejes = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY_INV)
+    # --- A. CALIBRACIÓN GEOMÉTRICA DE EJES ---
+    _, thresh_ejes = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
     alto, ancho = gray.shape
     
     kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho * 0.15), 1))
@@ -52,72 +52,50 @@ def procesar_campo_visual(image_bytes):
         
     pixels_por_10_grados = distancia_60_grados / 6.0
     
-    # --- B. DETECCIÓN DE PUNTOS: FILTRO DE DOBLE CAPA ---
+    # --- B. DETECCIÓN DE PUNTOS (Filtro OTSU + Análisis de Núcleo) ---
+    
+    # OTSU: Calcula automáticamente el mejor contraste sin importar si la foto es clara u oscura
+    _, thresh_simbolos = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    contornos, _ = cv2.findContours(thresh_simbolos, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     puntos_totales = []
-    cuadrados_detectados_centros = []
     
-    # CAPA 1: Extracción pura de Cuadrados Negros (■)
-    _, thresh_oscuro = cv2.threshold(gray, 110, 255, cv2.THRESH_BINARY_INV)
-    # El bloque 3x3 destruye las cruces (+) y los círculos (○). Solo sobreviven los (■).
-    kernel_cuadrados = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mascara_cuadrados = cv2.morphologyEx(thresh_oscuro, cv2.MORPH_OPEN, kernel_cuadrados)
-    
-    contornos_cuadrados, _ = cv2.findContours(mascara_cuadrados, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for cnt in contornos_cuadrados:
-        x, y, w, h = cv2.boundingRect(cnt)
-        area = w * h
-        # Si tiene tamaño de cuadradito...
-        if 6 < area < 400:
-            px, py = x + w//2, y + h//2
-            dx, dy = px - cx, py - cy
-            radio_pixel = math.sqrt(dx**2 + dy**2)
-            grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
-            
-            if 2 < grados_fisicos <= 41: # Ignoramos la cruz central exacta
-                angulo = math.degrees(math.atan2(dy, dx))
-                if angulo < 0: angulo += 360
-                
-                puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': 'fallado'})
-                cuadrados_detectados_centros.append((px, py))
-                cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Puntito Rojo
-                
-    # CAPA 2: Extracción de Círculos Vistos (○)
-    _, thresh_claro = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-    contornos_todos, _ = cv2.findContours(thresh_claro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for cnt in contornos_todos:
+    for cnt in contornos:
         x, y, w, h = cv2.boundingRect(cnt)
         area = w * h
         aspect_ratio = float(w)/h if h > 0 else 0
         
-        if 8 < area < 300 and 0.5 < aspect_ratio < 2.0:
-            px, py = x + w//2, y + h//2
+        # Filtros de tamaño muy tolerantes (acepta símbolos desde 6 hasta 900 píxeles)
+        if 6 < area < 900 and 0.4 < aspect_ratio < 2.5:
+            px = x + w // 2
+            py = y + h // 2
+            dx, dy = px - cx, py - cy
+            radio_pixel = math.hypot(dx, dy)
+            grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
             
-            # Verificamos que no sea un cuadrado que ya detectamos en la Capa 1
-            ya_detectado = False
-            for (cx_sq, cy_sq) in cuadrados_detectados_centros:
-                if math.hypot(px - cx_sq, py - cy_sq) < 8:
-                    ya_detectado = True
-                    break
-                    
-            if not ya_detectado:
-                # Comprobamos si el centro está "hueco"
-                roi = thresh_claro[y:y+h, x:x+w]
-                cy_box, cx_box = h // 2, w // 2
-                parche_central = roi[max(0, cy_box-1):min(h, cy_box+2), max(0, cx_box-1):min(w, cx_box+2)]
+            # Solo analizamos dentro de los 41 grados (ignorando el centro exacto)
+            if 2 < grados_fisicos <= 41:
                 
-                if parche_central.size > 0 and cv2.countNonZero(parche_central) < (parche_central.size * 0.4):
-                    dx, dy = px - cx, py - cy
-                    radio_pixel = math.sqrt(dx**2 + dy**2)
-                    grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
+                # LA MAGIA: Extraemos el "Tercio Central" del símbolo
+                y_start, y_end = y + h//3, y + 2*h//3
+                x_start, x_end = x + w//3, x + 2*w//3
+                
+                if y_end > y_start and x_end > x_start:
+                    nucleo = thresh_simbolos[y_start:y_end, x_start:x_end]
+                    pixeles_tinta = cv2.countNonZero(nucleo)
+                    area_nucleo = nucleo.size
                     
-                    if 2 < grados_fisicos <= 41:
-                        angulo = math.degrees(math.atan2(dy, dx))
-                        if angulo < 0: angulo += 360
+                    # Si el núcleo está más del 40% lleno de tinta, es un cuadrado macizo ■
+                    if (pixeles_tinta / area_nucleo) > 0.4:
+                        tipo = 'fallado'
+                        cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Puntito Rojo de Auditoría
+                    else:
+                        tipo = 'visto' # Centro vacío = Círculo ○
+                        cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Puntito Verde de Auditoría
                         
-                        puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': 'visto'})
-                        cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Puntito Verde
+                    angulo = math.degrees(math.atan2(dy, dx))
+                    if angulo < 0: angulo += 360
+                    puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
 
     # --- C. ANÁLISIS POR ZONAS Y MAPA DE CALOR ---
     grados_no_vistos_total = 0
@@ -171,7 +149,7 @@ def procesar_campo_visual(image_bytes):
     porcentaje_perdida_cv = (grados_no_vistos_total / 320.0) * 100
     incapacidad_ojo = porcentaje_perdida_cv * 0.25
 
-    return img_heatmap, grados_no_vistos_total, incapacidad_ojo# ==========================================
+    return img_heatmap, grados_no_vistos_total, incapacidad_ojo
 # 2. INTERFAZ DE USUARIO (WEB APP)
 # ==========================================
 
