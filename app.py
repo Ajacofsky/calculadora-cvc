@@ -72,10 +72,89 @@ def procesar_campo_visual(image_bytes):
         if 8 < area_caja < max_area_esperada and 0.4 < aspect_ratio < 2.5:
             
             # MAGIA: Evaluamos el contenido mirando la imagen ORIGINAL (thresh)
-            # Así los cuadrados centrales no pierden su "tinta" por culpa de los ejes
             roi_original = thresh[y:y+h, x:x+w]
             pixeles_tinta = cv2.countNonZero(roi_original)
-            indice_relleno = pixeles_
+            indice_relleno = pixeles_tinta / float(area_caja)
+            
+            # Test Morfológico de Grosor (Lijado)
+            kernel_size = max(2, int(min(w, h) * 0.3))
+            kernel_test = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+            roi_eroded = cv2.erode(roi_original, kernel_test, iterations=1)
+            es_macizo = cv2.countNonZero(roi_eroded) > 0
+            
+            px, py = x + w//2, y + h//2
+            dx, dy = px - cx, py - cy
+            radio_pixel = math.hypot(dx, dy)
+            grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
+            
+            if 2 < grados_fisicos <= 41:
+                angulo = math.degrees(math.atan2(dy, dx))
+                if angulo < 0: angulo += 360
+                
+                # REGLA DE ORO ACTUALIZADA
+                if indice_relleno > 0.55 or es_macizo: 
+                    tipo = 'fallado'
+                    cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo
+                else:                     
+                    tipo = 'visto'
+                    cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde
+                    
+                puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
+
+    # --- C. ANÁLISIS POR ZONAS Y MAPA DE CALOR ---
+    grados_no_vistos_total = 0
+    
+    for i in range(1, 5):
+        radio_dibujo = int(i * pixels_por_10_grados)
+        cv2.circle(img_heatmap, (cx, cy), radio_dibujo, (0, 0, 255), 1)
+        
+    for anillo in range(4):
+        limite_inf = anillo * 10
+        limite_sup = (anillo + 1) * 10
+        
+        for octante in range(8):
+            ang_inf = octante * 45
+            ang_sup = (octante + 1) * 45
+            
+            puntos_zona = [p for p in puntos_totales if limite_inf <= p['r'] < limite_sup and ang_inf <= p['ang'] < ang_sup]
+            
+            total_pts = len(puntos_zona)
+            fallados = sum(1 for p in puntos_zona if p['tipo'] == 'fallado')
+            
+            color_zona = None
+            grados_perdidos = 0
+            
+            if total_pts > 0:
+                densidad = (fallados / total_pts) * 100
+                
+                if densidad >= 70:
+                    grados_perdidos = 10
+                    color_zona = (255, 200, 0) # Celeste
+                elif 0 < densidad < 70:
+                    grados_perdidos = 5
+                    color_zona = (0, 255, 255) # Amarillo
+            
+            grados_no_vistos_total += grados_perdidos
+            
+            if color_zona:
+                r_in = int(limite_inf * (pixels_por_10_grados/10))
+                r_out = int(limite_sup * (pixels_por_10_grados/10))
+                cv2.ellipse(overlay, (cx, cy), (r_out, r_out), 0, ang_inf, ang_sup, color_zona, -1)
+                cv2.ellipse(overlay, (cx, cy), (r_in, r_in), 0, ang_inf, ang_sup, (255, 255, 255), -1)
+
+    cv2.addWeighted(overlay, 0.4, img_heatmap, 0.6, 0, img_heatmap)
+    
+    for angulo_linea in range(0, 360, 45):
+        rad = math.radians(angulo_linea)
+        x2 = int(cx + (4.2 * pixels_por_10_grados) * math.cos(rad))
+        y2 = int(cy + (4.2 * pixels_por_10_grados) * math.sin(rad))
+        cv2.line(img_heatmap, (cx, cy), (x2, y2), (0, 0, 255), 1)
+
+    porcentaje_perdida_cv = (grados_no_vistos_total / 320.0) * 100
+    incapacidad_ojo = porcentaje_perdida_cv * 0.25
+
+    return img_heatmap, grados_no_vistos_total, incapacidad_ojo
+
 # ==========================================
 # 2. INTERFAZ DE USUARIO (WEB APP)
 # ==========================================
@@ -84,29 +163,25 @@ st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
 
 st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
 st.markdown("""
-**Método de Análisis:** Detección morfológica por tamaño y solidez.
+**Método de Análisis:** Detección morfológica con evaluación original.
 - **Puntos Rojos:** Cuadrados negros detectados (Fallados).
 - **Puntos Verdes:** Círculos detectados (Vistos).
 - **Regla:** Densidad ≥ 70% = 10° (Celeste) | > 0% = 5° (Amarillo).
 """)
 
-modo_evaluacion = st.radio("Seleccione el tipo de evaluación:", ["Unilateral (Un solo ojo)", "Bilateral (Ambos ojos)"], key="radio_modo_v3")
+modo_evaluacion = st.radio("Seleccione el tipo de evaluación:", ["Unilateral (Un solo ojo)", "Bilateral (Ambos ojos)"], key="radio_modo_v4")
 
 col1, col2 = st.columns(2)
-
-incap_OD = 0.0
-incap_OI = 0.0
 
 def mostrar_resultado(columna, titulo, key_uploader):
     with columna:
         st.subheader(titulo)
         file = st.file_uploader(f"Subir imagen {titulo}", type=["jpg", "jpeg", "png"], key=key_uploader)
         if file is not None:
-            with st.spinner("Procesando imagen con algoritmo morfológico..."):
+            with st.spinner("Procesando imagen con algoritmo avanzado..."):
                 img_res, grados, incap = procesar_campo_visual(file.getvalue())
             
             if img_res is not None:
-                # Conversión segura a PIL para Streamlit Cloud
                 img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(img_rgb)
                 st.image(pil_img, caption=f"Auditoría y Mapa de Calor - {titulo}", use_container_width=True)
@@ -118,6 +193,7 @@ def mostrar_resultado(columna, titulo, key_uploader):
     return 0.0
 
 incap_OD = mostrar_resultado(col1, "Ojo Derecho (OD)", "file_od")
+incap_OI = 0.0
 
 if modo_evaluacion == "Bilateral (Ambos ojos)":
     incap_OI = mostrar_resultado(col2, "Ojo Izquierdo (OI)", "file_oi")
