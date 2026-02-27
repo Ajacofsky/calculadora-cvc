@@ -23,8 +23,8 @@ def procesar_campo_visual(image_bytes):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     alto, ancho = gray.shape
     
-    # 1. BINARIZACIÓN ADAPTATIVA (Inmune a los centros iluminados/grises)
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 8)
+    # 1. Binarización Adaptativa
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 8)
     
     # --- A. CALIBRACIÓN GEOMÉTRICA BLINDADA ---
     mask_ejes = thresh.copy()
@@ -54,81 +54,55 @@ def procesar_campo_visual(image_bytes):
         dist_60 = int((ancho - cx) * 0.75)
         pixels_por_10_grados = dist_60 / 6.0
 
-    # --- B. EXTRACCIÓN MORFOLÓGICA DE SÍMBOLOS (NMS) ---
+    # --- B. DETECCIÓN POR FUSIÓN Y DENSIDAD ---
     
-    # PASO 1: Aislar SÓLO los cuadrados macizos (Destruyendo líneas finas y círculos)
-    kernel_sq = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    solo_cuadrados = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_sq)
-    
-    contornos_sq, _ = cv2.findContours(solo_cuadrados, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    puntos_fallados_raw = []
-    
-    for cnt in contornos_sq:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if w * h > 6: # Filtro de ruido
-            px, py = x + w//2, y + h//2
-            puntos_fallados_raw.append((px, py))
-
-    # PASO 2: Restar ejes para buscar los círculos sin falsos positivos
+    # Aislar ejes y dilatarlos suavemente
     ejes_unidos = cv2.bitwise_or(lineas_h, lineas_v)
-    ejes_gruesos = cv2.dilate(ejes_unidos, cv2.getStructuringElement(cv2.MORPH_RECT, (3,3)))
-    thresh_sin_ejes = cv2.subtract(thresh, ejes_gruesos)
+    ejes_dilated = cv2.dilate(ejes_unidos, np.ones((3,3), np.uint8))
     
-    contornos_restantes, _ = cv2.findContours(thresh_sin_ejes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    puntos_vistos_raw = []
+    # Restar ejes para aislar símbolos
+    thresh_sin_ejes = cv2.subtract(thresh, ejes_dilated)
     
-    # Radio de seguridad para agrupar fragmentos del mismo símbolo
-    radio_nms = pixels_por_10_grados * 0.3 
-    max_area_esperada = (pixels_por_10_grados * 0.8) ** 2
+    # MAGIA 1: Fusión. Cerramos los huecos que dejaron los ejes al cortar los cuadrados
+    thresh_fusion = cv2.morphologyEx(thresh_sin_ejes, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
     
-    for cnt in contornos_restantes:
-        x, y, w, h = cv2.boundingRect(cnt)
-        area = w * h
-        aspect = float(w)/h if h > 0 else 0
-        
-        if 4 < area < max_area_esperada and 0.2 < aspect < 5.0:
-            px, py = x + w//2, y + h//2
-            
-            # 1. ¿Es un pedazo de un cuadrado ya detectado en el PASO 1?
-            es_cuadrado = False
-            for (sq_x, sq_y) in puntos_fallados_raw:
-                if math.hypot(px - sq_x, py - sq_y) < radio_nms:
-                    es_cuadrado = True
-                    break
-            
-            if not es_cuadrado:
-                # 2. ¿Es un fragmento de un círculo ya contado? (Agrupación NMS)
-                es_nuevo = True
-                for (v_x, v_y) in puntos_vistos_raw:
-                    if math.hypot(px - v_x, py - v_y) < radio_nms:
-                        es_nuevo = False
-                        break
-                
-                if es_nuevo:
-                    puntos_vistos_raw.append((px, py))
-
-    # PASO 3: Filtrar por zona útil clínica (<= 41 grados) y dibujar auditoría
+    contornos, _ = cv2.findContours(thresh_fusion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     puntos_totales = []
     
-    for px, py in puntos_fallados_raw:
-        dx, dy = px - cx, py - cy
-        r_pixel = math.hypot(dx, dy)
-        g_fisicos = (r_pixel / pixels_por_10_grados) * 10
-        if 2 < g_fisicos <= 41:
-            ang = math.degrees(math.atan2(dy, dx))
-            if ang < 0: ang += 360
-            puntos_totales.append({'r': g_fisicos, 'ang': ang, 'tipo': 'fallado'})
-            cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo Auditoría
-
-    for px, py in puntos_vistos_raw:
-        dx, dy = px - cx, py - cy
-        r_pixel = math.hypot(dx, dy)
-        g_fisicos = (r_pixel / pixels_por_10_grados) * 10
-        if 2 < g_fisicos <= 41:
-            ang = math.degrees(math.atan2(dy, dx))
-            if ang < 0: ang += 360
-            puntos_totales.append({'r': g_fisicos, 'ang': ang, 'tipo': 'visto'})
-            cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde Auditoría
+    max_area_esperada = (pixels_por_10_grados * 0.8) ** 2
+    
+    for cnt in contornos:
+        x, y, w, h = cv2.boundingRect(cnt)
+        
+        # Filtrar ruido minúsculo
+        if 5 < w * h < max_area_esperada:
+            # Evaluar el contenido exacto dentro de la caja
+            roi_eval = thresh_sin_ejes[y:y+h, x:x+w]
+            
+            # Prueba de robustez: Erosión 2x2. (Destruye líneas finas, sobreviven bloques gruesos)
+            eroded = cv2.erode(roi_eval, np.ones((2,2), np.uint8), iterations=1)
+            
+            # Prueba de Densidad
+            densidad_caja = cv2.countNonZero(roi_eval) / float(w * h)
+            
+            px, py = x + w//2, y + h//2
+            dx, dy = px - cx, py - cy
+            r_pixel = math.hypot(dx, dy)
+            g_fisicos = (r_pixel / pixels_por_10_grados) * 10
+            
+            if 2 < g_fisicos <= 41:
+                ang = math.degrees(math.atan2(dy, dx))
+                if ang < 0: ang += 360
+                
+                # REGLA DEFINITIVA: Si sobrevivió a la erosión (bloque) o si está lleno más del 40%
+                if cv2.countNonZero(eroded) > 0 or densidad_caja > 0.40:
+                    tipo = 'fallado'
+                    cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Rojo
+                else:
+                    tipo = 'visto'
+                    cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Verde
+                    
+                puntos_totales.append({'r': g_fisicos, 'ang': ang, 'tipo': tipo})
 
     # --- C. ANÁLISIS POR ZONAS Y MAPA DE CALOR ---
     grados_no_vistos_total = 0
@@ -145,101 +119,4 @@ def procesar_campo_visual(image_bytes):
             ang_inf = octante * 45
             ang_sup = (octante + 1) * 45
             
-            puntos_zona = [p for p in puntos_totales if limite_inf <= p['r'] < limite_sup and ang_inf <= p['ang'] < ang_sup]
-            
-            total_pts = len(puntos_zona)
-            fallados = sum(1 for p in puntos_zona if p['tipo'] == 'fallado')
-            
-            color_zona = None
-            grados_perdidos = 0
-            
-            if total_pts > 0:
-                densidad = (fallados / total_pts) * 100
-                
-                if densidad >= 70:
-                    grados_perdidos = 10
-                    color_zona = (255, 200, 0) # Celeste
-                elif 0 < densidad < 70:
-                    grados_perdidos = 5
-                    color_zona = (0, 255, 255) # Amarillo
-            
-            grados_no_vistos_total += grados_perdidos
-            
-            if color_zona:
-                r_in = int(limite_inf * (pixels_por_10_grados/10))
-                r_out = int(limite_sup * (pixels_por_10_grados/10))
-                cv2.ellipse(overlay, (cx, cy), (r_out, r_out), 0, ang_inf, ang_sup, color_zona, -1)
-                cv2.ellipse(overlay, (cx, cy), (r_in, r_in), 0, ang_inf, ang_sup, (255, 255, 255), -1)
-
-    cv2.addWeighted(overlay, 0.4, img_heatmap, 0.6, 0, img_heatmap)
-    
-    for angulo_linea in range(0, 360, 45):
-        rad = math.radians(angulo_linea)
-        x2 = int(cx + (4.2 * pixels_por_10_grados) * math.cos(rad))
-        y2 = int(cy + (4.2 * pixels_por_10_grados) * math.sin(rad))
-        cv2.line(img_heatmap, (cx, cy), (x2, y2), (0, 0, 255), 1)
-
-    porcentaje_perdida_cv = (grados_no_vistos_total / 320.0) * 100
-    incapacidad_ojo = porcentaje_perdida_cv * 0.25
-
-    return img_heatmap, grados_no_vistos_total, incapacidad_ojo
-
-# ==========================================
-# 2. INTERFAZ DE USUARIO (WEB APP)
-# ==========================================
-
-st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
-
-st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
-st.markdown("""
-**Método de Análisis:** Aislamiento Morfológico y Supresión de No-Máximos (NMS).
-- **Puntos Rojos:** Cuadrados negros detectados (Fallados).
-- **Puntos Verdes:** Círculos detectados (Vistos).
-""")
-
-modo_evaluacion = st.radio("Seleccione el tipo de evaluación:", ["Unilateral (Un solo ojo)", "Bilateral (Ambos ojos)"], key="modo_radio_final")
-
-col1, col2 = st.columns(2)
-
-def mostrar_resultado(columna, titulo, key_uploader):
-    with columna:
-        st.subheader(titulo)
-        file = st.file_uploader(f"Subir imagen {titulo}", type=["jpg", "jpeg", "png"], key=key_uploader)
-        if file is not None:
-            with st.spinner("Procesando mapa de densidades..."):
-                img_res, grados, incap = procesar_campo_visual(file.getvalue())
-            
-            if img_res is not None:
-                img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(img_rgb)
-                st.image(pil_img, caption=f"Mapa de Calor - {titulo}", use_container_width=True)
-                st.success(f"**Grados No Vistos:** {grados}° / 320°")
-                st.metric(label=f"Incapacidad {titulo}", value=f"{incap:.2f}%")
-                return incap
-            else:
-                st.error("Error al procesar.")
-    return 0.0
-
-incap_OD = mostrar_resultado(col1, "Ojo Derecho (OD)", "od_file")
-incap_OI = 0.0
-
-if modo_evaluacion == "Bilateral (Ambos ojos)":
-    incap_OI = mostrar_resultado(col2, "Ojo Izquierdo (OI)", "oi_file")
-
-# ==========================================
-# 3. RESULTADO FINAL LEGAL
-# ==========================================
-st.divider()
-st.header("📊 Informe Final de Incapacidad Visual")
-
-if modo_evaluacion == "Bilateral (Ambos ojos)":
-    if incap_OD > 0 and incap_OI > 0:
-        suma_aritmetica = incap_OD + incap_OI
-        incapacidad_bilateral = suma_aritmetica * 1.5
-        
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Suma Aritmética", f"{suma_aritmetica:.2f}%")
-        col_b.metric("Factor Bilateralidad", "x 1.5")
-        col_c.metric("Incapacidad Total", f"{incapacidad_bilateral:.2f}%", delta="Final Legal")
-    else:
-        st.info("Suba ambas imágenes para el cálculo bilateral.")
+            puntos_zona = [p for p in puntos_totales if limite_inf <= p['
