@@ -23,16 +23,20 @@ def procesar_campo_visual(image_bytes):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     alto, ancho = gray.shape
     
-    # Binarización automática (OTSU) para adaptarse a cualquier contraste
+    # Binarización automática (OTSU) para adaptar el contraste
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # --- A. CALIBRACIÓN GEOMÉTRICA ---
-    # Usamos kernels muy grandes para encontrar solo los ejes principales
-    kernel_h_axis = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho * 0.2), 2))
-    lineas_h = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h_axis)
+    # --- A. CALIBRACIÓN GEOMÉTRICA BLINDADA ---
+    # Enmascaramos (borramos) el 25% inferior para que la tabla no confunda a los ejes
+    mask_ejes = thresh.copy()
+    limite_inferior = int(alto * 0.75)
+    mask_ejes[limite_inferior:, :] = 0 
     
-    kernel_v_axis = cv2.getStructuringElement(cv2.MORPH_RECT, (2, int(alto * 0.2)))
-    lineas_v = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_v_axis)
+    kernel_h_axis = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho * 0.2), 1))
+    lineas_h = cv2.morphologyEx(mask_ejes, cv2.MORPH_OPEN, kernel_h_axis)
+    
+    kernel_v_axis = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(alto * 0.2)))
+    lineas_v = cv2.morphologyEx(mask_ejes, cv2.MORPH_OPEN, kernel_v_axis)
     
     interseccion = cv2.bitwise_and(lineas_h, lineas_v)
     y_coords, x_coords = np.where(interseccion > 0)
@@ -42,86 +46,64 @@ def procesar_campo_visual(image_bytes):
     else:
         cx, cy = int(ancho / 2), int(alto / 2)
         
-    # Calcular escala
-    fila_eje_h = lineas_h[cy-5 : cy+5, :]
+    # Calcular escala (solo buscando en la mitad derecha del eje horizontal)
+    fila_eje_h = lineas_h[cy-5 : cy+5, cx:] 
     _, x_h = np.where(fila_eje_h > 0)
     if len(x_h) > 0:
-        dist_60 = np.max(x_h) - cx
+        dist_60 = np.max(x_h) # Distancia desde el centro al borde de la línea
+        pixels_por_10_grados = dist_60 / 6.0
     else:
-        dist_60 = int((ancho - cx) * 0.8)
+        dist_60 = int((ancho - cx) * 0.75)
+        pixels_por_10_grados = dist_60 / 6.0
     
-    pixels_por_10_grados = dist_60 / 6.0
+    # --- B. DETECCIÓN DE SÍMBOLOS (ÍNDICE DE RELLENO / EXTENT) ---
     
-    # --- B. DETECCIÓN ROBUSTA POR TAMAÑO MORFOLÓGICO ---
+    # Restamos las líneas de los ejes para que no se peguen a los cuadraditos
+    thresh_sin_ejes = cv2.subtract(thresh, cv2.bitwise_or(lineas_h, lineas_v))
+    
+    contornos, _ = cv2.findContours(thresh_sin_ejes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     puntos_totales = []
     
-    # 1. Definimos el tamaño esperado de un cuadrado (aprox. 1/6 de un sector de 10°)
-    tamano_simbolo_estimado = int(pixels_por_10_grados / 6.0)
-    # Creamos un kernel de erosión que sea un poco más chico que un cuadrado, 
-    # pero definitivamente más grande que un círculo o una línea.
-    kernel_size = max(3, int(tamano_simbolo_estimado * 0.8))
-    kernel_erosion = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    max_area_esperada = (pixels_por_10_grados * 0.8) ** 2
     
-    # 2. APLICAMOS EROSIÓN AGRESIVA: Solo sobreviven los objetos grandes y macizos (■)
-    thresh_solo_cuadrados = cv2.erode(thresh, kernel_erosion, iterations=1)
-    
-    # Encontramos los centros de los cuadrados sobrevivientes
-    contornos_cuadrados, _ = cv2.findContours(thresh_solo_cuadrados, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    centros_cuadrados = []
-    for cnt in contornos_cuadrados:
-        M = cv2.moments(cnt)
-        if M["m00"] > 0:
-            px, py = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-            centros_cuadrados.append((px, py))
-
-    # 3. Analizamos TODOS los objetos en la imagen original
-    contornos_todos, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for cnt in contornos_todos:
+    for cnt in contornos:
         x, y, w, h = cv2.boundingRect(cnt)
-        area = w * h
+        area_caja = w * h
         aspect_ratio = float(w)/h if h > 0 else 0
         
-        # Filtro laxo para descartar ruido muy pequeño o líneas muy largas
-        if 5 < area < (pixels_por_10_grados**2) and 0.3 < aspect_ratio < 3.0:
-            px, py = x + w//2, y + h//2
+        # Filtramos ruido minúsculo y objetos gigantes
+        if 8 < area_caja < max_area_esperada and 0.4 < aspect_ratio < 2.5:
             
-            # Coordenadas polares
+            # MAGIA MATEMÁTICA: Calculamos qué porcentaje de la caja tiene tinta
+            roi = thresh_sin_ejes[y:y+h, x:x+w]
+            pixeles_tinta = cv2.countNonZero(roi)
+            indice_relleno = pixeles_tinta / float(area_caja)
+            
+            px, py = x + w//2, y + h//2
             dx, dy = px - cx, py - cy
-            radio_pixel = math.sqrt(dx**2 + dy**2)
+            radio_pixel = math.hypot(dx, dy)
             grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
             
             if 2 < grados_fisicos <= 41: # Ignoramos el centro exacto
                 angulo = math.degrees(math.atan2(dy, dx))
                 if angulo < 0: angulo += 360
                 
-                # DETERMINACIÓN DEL TIPO:
-                # ¿Este punto coincide con la ubicación de un cuadrado que sobrevivió a la erosión?
-                es_cuadrado_macizo = False
-                for (sq_x, sq_y) in centros_cuadrados:
-                    distancia = math.hypot(px - sq_x, py - sq_y)
-                    if distancia < (kernel_size * 2): # Si está muy cerca de un sobreviviente
-                        es_cuadrado_macizo = True
-                        break
-                
-                if es_cuadrado_macizo:
+                # REGLA DE CLASIFICACIÓN
+                if indice_relleno > 0.55: # Más del 55% lleno de tinta = Cuadrado
                     tipo = 'fallado'
-                    # Auditoría: Círculo ROJO relleno grande
-                    cv2.circle(img_heatmap, (px, py), int(kernel_size), (0, 0, 255), -1)
-                else:
+                    cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo
+                else:                     # Menos del 55% (tiene hueco) = Círculo
                     tipo = 'visto'
-                    # Auditoría: Círculo VERDE relleno pequeño
-                    cv2.circle(img_heatmap, (px, py), int(kernel_size/2), (0, 255, 0), -1)
+                    cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde
                     
                 puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
 
     # --- C. ANÁLISIS POR ZONAS Y MAPA DE CALOR ---
     grados_no_vistos_total = 0
     
-    # Dibujar anillos de referencia
     for i in range(1, 5):
         radio_dibujo = int(i * pixels_por_10_grados)
-        cv2.circle(img_heatmap, (cx, cy), radio_dibujo, (0, 0, 255), 2) # Anillos más gruesos
+        cv2.circle(img_heatmap, (cx, cy), radio_dibujo, (0, 0, 255), 1)
         
     for anillo in range(4):
         limite_inf = anillo * 10
@@ -144,44 +126,31 @@ def procesar_campo_visual(image_bytes):
                 
                 if densidad >= 70:
                     grados_perdidos = 10
-                    color_zona = (255, 200, 0) # Celeste (BGR)
+                    color_zona = (255, 200, 0) # Celeste
                 elif 0 < densidad < 70:
                     grados_perdidos = 5
-                    color_zona = (0, 255, 255) # Amarillo (BGR)
+                    color_zona = (0, 255, 255) # Amarillo
             
             grados_no_vistos_total += grados_perdidos
             
             if color_zona:
                 r_in = int(limite_inf * (pixels_por_10_grados/10))
                 r_out = int(limite_sup * (pixels_por_10_grados/10))
-                # Dibujar la zona coloreada
                 cv2.ellipse(overlay, (cx, cy), (r_out, r_out), 0, ang_inf, ang_sup, color_zona, -1)
-                # "Borrar" el centro para que quede el anillo
-                cv2.ellipse(overlay, (cx, cy), (r_in, r_in), 0, ang_inf, ang_sup, (0, 0, 0), -1)
+                cv2.ellipse(overlay, (cx, cy), (r_in, r_in), 0, ang_inf, ang_sup, (255, 255, 255), -1)
 
-    # Crear máscara para el overlay (donde no es negro, aplicamos color)
-    mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
-    img_heatmap_masked = cv2.bitwise_and(img_heatmap, img_heatmap, mask=cv2.bitwise_not(mask))
-    overlay_masked = cv2.bitwise_and(overlay, overlay, mask=mask)
-    final_composition = cv2.add(img_heatmap_masked, overlay_masked)
-    # Mezclar con un poco de transparencia sobre la imagen original marcada
-    cv2.addWeighted(final_composition, 0.5, img_heatmap, 0.5, 0, img_heatmap)
-
-    # Dibujar ejes finales
-    cv2.line(img_heatmap, (cx, 0), (cx, alto), (0, 0, 255), 2)
-    cv2.line(img_heatmap, (0, cy), (ancho, cy), (0, 0, 255), 2)
-    for angulo_linea in range(45, 360, 90):
+    cv2.addWeighted(overlay, 0.4, img_heatmap, 0.6, 0, img_heatmap)
+    
+    for angulo_linea in range(0, 360, 45):
         rad = math.radians(angulo_linea)
         x2 = int(cx + (4.2 * pixels_por_10_grados) * math.cos(rad))
         y2 = int(cy + (4.2 * pixels_por_10_grados) * math.sin(rad))
-        cv2.line(img_heatmap, (cx, cy), (x2, y2), (0, 0, 255), 2)
+        cv2.line(img_heatmap, (cx, cy), (x2, y2), (0, 0, 255), 1)
 
     porcentaje_perdida_cv = (grados_no_vistos_total / 320.0) * 100
     incapacidad_ojo = porcentaje_perdida_cv * 0.25
 
     return img_heatmap, grados_no_vistos_total, incapacidad_ojo
-
 # ==========================================
 # 2. INTERFAZ DE USUARIO (WEB APP)
 # ==========================================
