@@ -1,249 +1,125 @@
 import streamlit as st
 import cv2
 import numpy as np
-import math
 from PIL import Image
-import traceback
 
-# Configuración inicial de la página
-st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
+st.set_page_config(page_title="Detector Base de CVC", layout="wide")
 
-# ==========================================
-# 1. MOTOR DE VISIÓN COMPUTARIZADA Y LÓGICA
-# ==========================================
+st.title("🔬 Módulo de Prueba: Detección Pura de Símbolos")
+st.markdown("Si este módulo no detecta los cuadrados correctamente, no avanzaremos al cálculo legal. Sube una imagen para auditar el motor de visión.")
 
-def procesar_campo_visual(image_bytes):
-    try:
-        if not image_bytes:
-            return None, 0, 0, "No hay imagen"
+def detectar_simbolos(image_bytes):
+    # 1. Cargar imagen y convertir a escala de grises
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    img_debug = img.copy()
+    
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # 2. Binarización (Tinta negra = Blanco 255, Papel = Negro 0)
+    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    alto, ancho = thresh.shape
+    
+    # --- A. ENCONTRAR EL CENTRO EXACTO (MÉTODO DE PROYECCIÓN) ---
+    # Ignoramos el 25% superior e inferior para que el texto/leyenda no interfiera
+    zona_media_y = thresh[int(alto*0.25):int(alto*0.75), :]
+    suma_filas = np.sum(zona_media_y, axis=1)
+    cy = np.argmax(suma_filas) + int(alto*0.25) # La fila con más tinta es el eje X
+    
+    zona_media_x = thresh[:, int(ancho*0.25):int(ancho*0.75)]
+    suma_columnas = np.sum(zona_media_x, axis=0)
+    cx = np.argmax(suma_columnas) + int(ancho*0.25) # La columna con más tinta es el eje Y
+    
+    # Dibujar cruz AZUL para demostrar que encontramos el centro real
+    cv2.line(img_debug, (0, cy), (ancho, cy), (255, 0, 0), 1)
+    cv2.line(img_debug, (cx, 0), (cx, alto), (255, 0, 0), 1)
 
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            return None, 0, 0, "No se pudo decodificar la imagen."
-
-        img_heatmap = img.copy()
-        overlay = img.copy()
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        alto, ancho = gray.shape
-        
-        # Binarización Adaptativa
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 8)
-        
-        # --- A. CALIBRACIÓN GEOMÉTRICA ---
-        mask_ejes = thresh.copy()
-        limite_inferior = int(alto * 0.75)
-        mask_ejes[limite_inferior:, :] = 0 
-        
-        kernel_h_axis = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho * 0.2), 1))
-        lineas_h = cv2.morphologyEx(mask_ejes, cv2.MORPH_OPEN, kernel_h_axis)
-        
-        kernel_v_axis = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(alto * 0.2)))
-        lineas_v = cv2.morphologyEx(mask_ejes, cv2.MORPH_OPEN, kernel_v_axis)
-        
-        interseccion = cv2.bitwise_and(lineas_h, lineas_v)
-        y_coords, x_coords = np.where(interseccion > 0)
-        
-        if len(x_coords) > 0:
-            cx, cy = int(np.mean(x_coords)), int(np.mean(y_coords))
-        else:
-            cx, cy = int(ancho / 2), int(alto / 2)
-            
-        fila_eje_h = lineas_h[cy-5 : cy+5, cx:] 
-        _, x_h = np.where(fila_eje_h > 0)
-        
-        if len(x_h) > 0:
-            dist_60 = np.max(x_h) 
-            pixels_por_10_grados = float(dist_60 / 6.0)
-        else:
-            dist_60 = int((ancho - cx) * 0.75)
-            pixels_por_10_grados = float(dist_60 / 6.0)
-
-        if pixels_por_10_grados <= 0:
-            pixels_por_10_grados = 1.0 
-
-        puntos_totales = []
-
-        # --- B. EXTRACCIÓN ESTRUCTURAL PURA ---
-        
-        # 1. ATRApar SÓLO LOS CUADRADOS (Erosión destructiva)
-        k_size = max(3, int(pixels_por_10_grados * 0.08))
-        kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
-        eroded_squares = cv2.erode(thresh, kernel_erode, iterations=1)
-        
-        contornos_sq, _ = cv2.findContours(eroded_squares, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        centros_cuadrados = []
-        
-        for cnt in contornos_sq:
-            x, y, w, h = cv2.boundingRect(cnt)
-            if w > 1 and h > 1: # Ignorar ruido diminuto
-                px, py = x + w//2, y + h//2
-                centros_cuadrados.append((px, py))
-                
-                dx, dy = px - cx, py - cy
-                r_pixel = math.hypot(dx, dy)
-                g_fisicos = (r_pixel / pixels_por_10_grados) * 10
-                if 2 < g_fisicos <= 41:
-                    ang = math.degrees(math.atan2(dy, dx))
-                    if ang < 0: ang += 360
-                    puntos_totales.append({'r': g_fisicos, 'ang': ang, 'tipo': 'fallado'})
-                    cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Rojo
-
-        # 2. ATRAPAR SÓLO LOS CÍRCULOS (Por descarte)
-        ejes_unidos = cv2.bitwise_or(lineas_h, lineas_v)
-        ejes_dilated = cv2.dilate(ejes_unidos, np.ones((3,3), np.uint8))
-        thresh_sin_ejes = cv2.subtract(thresh, ejes_dilated)
-        
-        # Ocultar los cuadrados que ya atrapamos para no confundirlos
-        mask_cuadrados = np.zeros_like(thresh)
-        for px, py in centros_cuadrados:
-            cv2.circle(mask_cuadrados, (px, py), int(k_size * 2), 255, -1)
-            
-        thresh_solo_circulos = cv2.subtract(thresh_sin_ejes, mask_cuadrados)
-        contornos_circ, _ = cv2.findContours(thresh_solo_circulos, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        centros_circulos = []
-        max_area_esperada = (pixels_por_10_grados * 0.8) ** 2
-        
-        for cnt in contornos_circ:
-            x, y, w, h = cv2.boundingRect(cnt)
-            area = w * h
-            if 4 < area < max_area_esperada:
-                px, py = x + w//2, y + h//2
-                
-                # Agrupar fragmentos del mismo círculo si fue cortado por la cruz
-                es_nuevo = True
-                for cx_circ, cy_circ in centros_circulos:
-                    if math.hypot(px - cx_circ, py - cy_circ) < (pixels_por_10_grados * 0.3):
-                        es_nuevo = False
-                        break
-                
-                if es_nuevo:
-                    centros_circulos.append((px, py))
-                    dx, dy = px - cx, py - cy
-                    r_pixel = math.hypot(dx, dy)
-                    g_fisicos = (r_pixel / pixels_por_10_grados) * 10
-                    if 2 < g_fisicos <= 41:
-                        ang = math.degrees(math.atan2(dy, dx))
-                        if ang < 0: ang += 360
-                        puntos_totales.append({'r': g_fisicos, 'ang': ang, 'tipo': 'visto'})
-                        cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Verde
-
-        # --- C. ANÁLISIS POR ZONAS Y MAPA DE CALOR ---
-        grados_no_vistos_total = 0
-        
-        for i in range(1, 5):
-            radio_dibujo = int(i * pixels_por_10_grados)
-            cv2.circle(img_heatmap, (cx, cy), radio_dibujo, (0, 0, 255), 1)
-            
-        for anillo in range(4):
-            limite_inf = anillo * 10
-            limite_sup = (anillo + 1) * 10
-            
-            for octante in range(8):
-                ang_inf = octante * 45
-                ang_sup = (octante + 1) * 45
-                
-                puntos_zona = [p for p in puntos_totales if limite_inf <= p['r'] < limite_sup and ang_inf <= p['ang'] < ang_sup]
-                
-                total_pts = len(puntos_zona)
-                fallados = sum(1 for p in puntos_zona if p['tipo'] == 'fallado')
-                
-                color_zona = None
-                grados_perdidos = 0
-                
-                if total_pts > 0:
-                    densidad = (fallados / total_pts) * 100
-                    
-                    if densidad >= 70:
-                        grados_perdidos = 10
-                        color_zona = (255, 200, 0) # Celeste
-                    elif 0 < densidad < 70:
-                        grados_perdidos = 5
-                        color_zona = (0, 255, 255) # Amarillo
-                
-                grados_no_vistos_total += grados_perdidos
-                
-                if color_zona:
-                    r_in = limite_inf * (pixels_por_10_grados/10.0)
-                    r_out = limite_sup * (pixels_por_10_grados/10.0)
-                    r_center = int((r_in + r_out) / 2.0)
-                    grosor = int(r_out - r_in)
-                    
-                    if grosor > 0:
-                        cv2.ellipse(overlay, (cx, cy), (r_center, r_center), 0, ang_inf, ang_sup, color_zona, grosor + 1)
-
-        cv2.addWeighted(overlay, 0.4, img_heatmap, 0.6, 0, img_heatmap)
-        
-        for angulo_linea in range(0, 360, 45):
-            rad = math.radians(angulo_linea)
-            x2 = int(cx + (4.2 * pixels_por_10_grados) * math.cos(rad))
-            y2 = int(cy + (4.2 * pixels_por_10_grados) * math.sin(rad))
-            cv2.line(img_heatmap, (cx, cy), (x2, y2), (0, 0, 255), 1)
-
-        porcentaje_perdida_cv = (grados_no_vistos_total / 320.0) * 100
-        incapacidad_ojo = porcentaje_perdida_cv * 0.25
-
-        return img_heatmap, grados_no_vistos_total, incapacidad_ojo, None
-
-    except Exception as e:
-        return None, 0, 0, traceback.format_exc()
-
-# ==========================================
-# 2. INTERFAZ DE USUARIO (WEB APP)
-# ==========================================
-
-st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
-st.markdown("**Sistema Activo:** Filtrado Morfológico por Erosión y Descarte.")
-
-modo_evaluacion = st.radio("Seleccione el tipo de evaluación:", ["Unilateral (Un solo ojo)", "Bilateral (Ambos ojos)"], key="modo_radio_final_v8")
-
-col1, col2 = st.columns(2)
-
-def mostrar_resultado(columna, titulo, key_uploader):
-    with columna:
-        st.subheader(titulo)
-        file = st.file_uploader(f"Subir imagen {titulo}", type=["jpg", "jpeg", "png"], key=key_uploader)
-        if file is not None:
-            with st.spinner("Procesando mapa de densidades..."):
-                img_res, grados, incap, error_msg = procesar_campo_visual(file.getvalue())
-            
-            if error_msg:
-                st.error("Error interno del sistema de visión:")
-                st.code(error_msg)
-                return 0.0
-            elif img_res is not None:
-                img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(img_rgb)
-                st.image(pil_img, caption=f"Mapa de Calor - {titulo}", use_container_width=True)
-                st.success(f"**Grados No Vistos:** {grados}° / 320°")
-                st.metric(label=f"Incapacidad {titulo}", value=f"{incap:.2f}%")
-                return incap
-            else:
-                st.error("Error desconocido al procesar.")
-    return 0.0
-
-incap_OD = mostrar_resultado(col1, "Ojo Derecho (OD)", "od_file")
-incap_OI = 0.0
-
-if modo_evaluacion == "Bilateral (Ambos ojos)":
-    incap_OI = mostrar_resultado(col2, "Ojo Izquierdo (OI)", "oi_file")
-
-# ==========================================
-# 3. RESULTADO FINAL LEGAL
-# ==========================================
-st.divider()
-st.header("📊 Informe Final de Incapacidad Visual")
-
-if modo_evaluacion == "Bilateral (Ambos ojos)":
-    if incap_OD > 0 and incap_OI > 0:
-        suma_aritmetica = incap_OD + incap_OI
-        incapacidad_bilateral = suma_aritmetica * 1.5
-        
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Suma Aritmética", f"{suma_aritmetica:.2f}%")
-        col_b.metric("Factor Bilateralidad", "x 1.5")
-        col_c.metric("Incapacidad Total", f"{incapacidad_bilateral:.2f}%", delta="Final Legal")
+    # --- B. AISLAR EL ÁREA DEL CAMPO VISUAL ---
+    # Encontramos hasta dónde llega el eje horizontal para saber el radio del campo
+    pixeles_eje_x = np.where(thresh[cy, :] > 0)[0]
+    if len(pixeles_eje_x) > 0:
+        radio_campo = int(max(cx - pixeles_eje_x[0], pixeles_eje_x[-1] - cx) * 1.05)
     else:
-        st.info("Suba ambas imágenes para el cálculo bilateral.")
+        radio_campo = int(min(ancho, alto) * 0.4)
+
+    # Crear una máscara circular para borrar los textos de afuera
+    mascara_circular = np.zeros_like(thresh)
+    cv2.circle(mascara_circular, (cx, cy), radio_campo, 255, -1)
+    campo_limpio = cv2.bitwise_and(thresh, mascara_circular)
+
+    # --- C. DETECCIÓN DE SÍMBOLOS (MUESTREO DE NÚCLEO) ---
+    
+    # Borramos temporalmente las líneas rectas de la grilla para separar los símbolos
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho*0.03), 1))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(alto*0.03)))
+    lineas_h = cv2.morphologyEx(campo_limpio, cv2.MORPH_OPEN, kernel_h)
+    lineas_v = cv2.morphologyEx(campo_limpio, cv2.MORPH_OPEN, kernel_v)
+    grilla = cv2.add(lineas_h, lineas_v)
+    grilla_engrosada = cv2.dilate(grilla, np.ones((3,3), np.uint8))
+    
+    # Restamos la grilla
+    simbolos_separados = cv2.subtract(campo_limpio, grilla_engrosada)
+    
+    # Pequeña dilatación para unir símbolos que hayan sido cortados por la resta
+    simbolos_unidos = cv2.dilate(simbolos_separados, np.ones((2,2), np.uint8))
+    
+    contornos, _ = cv2.findContours(simbolos_unidos, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Filtros de tamaño dinámicos basados en la resolución de la imagen
+    area_min = (ancho * 0.002) ** 2
+    area_max = (ancho * 0.02) ** 2
+    
+    cuadrados_encontrados = 0
+    circulos_encontrados = 0
+    
+    for cnt in contornos:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+        
+        # Si tiene el tamaño de un símbolo...
+        if area_min < area < area_max:
+            # MAGIA: Miramos el recuadro en la imagen ORIGINAL binarizada (campo_limpio)
+            roi = campo_limpio[y:y+h, x:x+w]
+            
+            # Extraemos el "corazón" del símbolo (el 40% del centro exacto)
+            y1_core, y2_core = int(h*0.3), int(h*0.7)
+            x1_core, x2_core = int(w*0.3), int(w*0.7)
+            
+            if y2_core > y1_core and x2_core > x1_core:
+                corazon = roi[y1_core:y2_core, x1_core:x2_core]
+                
+                # ¿Qué porcentaje del corazón es tinta negra?
+                porcentaje_tinta_corazon = np.sum(corazon > 0) / float(corazon.size)
+                
+                # Centro del símbolo para dibujar
+                px, py = x + w//2, y + h//2
+                
+                # Si el corazón es macizo (más del 55% de tinta)...
+                if porcentaje_tinta_corazon > 0.55:
+                    cuadrados_encontrados += 1
+                    cv2.rectangle(img_debug, (x, y), (x+w, y+h), (0, 0, 255), 2) # Caja Roja
+                else:
+                    # Si el corazón está vacío (papel blanco)...
+                    circulos_encontrados += 1
+                    cv2.rectangle(img_debug, (x, y), (x+w, y+h), (0, 255, 0), 1) # Caja Verde
+
+    return img_debug, cuadrados_encontrados, circulos_encontrados
+
+# --- INTERFAZ ---
+archivo = st.file_uploader("Sube un estudio de CVC para testear la detección", type=["jpg", "jpeg", "png"])
+
+if archivo is not None:
+    img_res, total_cuadrados, total_circulos = detectar_simbolos(archivo.getvalue())
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
+        st.image(Image.fromarray(img_rgb), caption="Auditoría Visual (Cruz Azul = Centro detectado)", use_container_width=True)
+    with col2:
+        st.metric("Cuadrados (Rojos)", total_cuadrados)
+        st.metric("Círculos/Huecos (Verdes)", total_circulos)
+        st.write("---")
+        st.write("**Instrucciones de Auditoría:**")
+        st.write("1. Verifica que la cruz azul esté en el centro exacto.")
+        st.write("2. Verifica que los cuadraditos negros tengan una caja **ROJA**.")
+        st.write("3. Si esto es perfecto, avísame y rearmamos el cálculo de incapacidad.")
