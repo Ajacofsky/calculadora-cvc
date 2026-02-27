@@ -119,4 +119,47 @@ def procesar_campo_visual(image_bytes):
             ang_inf = octante * 45
             ang_sup = (octante + 1) * 45
             
-            puntos_zona = [p for p in puntos_totales if limite_inf <= p['
+            puntos_zona = [p for p in puntos_totales if limite_inf <= p['r'] < limite_sup and ang_inf <= p['ang'] < ang_sup]
+            
+            total_pts = len(puntos_zona)
+            fallados = sum(1 for p in puntos_zona if p['tipo'] == 'fallado')
+            
+            color_zona = None
+            grados_perdidos = 0
+            
+            if total_pts > 0:
+                densidad = (fallados / total_pts) * 100
+                
+                if densidad >= 70:
+                    grados_perdidos = 10
+                    color_zona = (255, 200, 0) # Celeste
+                elif 0 < densidad < 70:
+                    grados_perdidos = 5
+                    color_zona = (0, 255, 255) # Amarillo
+            
+            grados_no_vistos_total += grados_perdidos
+            
+            # MAGIA 2: Dibujo de trazo grueso sin sobrescritura blanca
+            if color_zona:
+                r_in = limite_inf * (pixels_por_10_grados/10)
+                r_out = limite_sup * (pixels_por_10_grados/10)
+                r_center = int((r_in + r_out) / 2.0)
+                grosor = int(r_out - r_in)
+                
+                # Se dibuja la línea gruesa que encaja exactamente en el anillo correspondiente
+                cv2.ellipse(overlay, (cx, cy), (r_center, r_center), 0, ang_inf, ang_sup, color_zona, grosor + 1)
+
+    cv2.addWeighted(overlay, 0.4, img_heatmap, 0.6, 0, img_heatmap)
+    
+    for angulo_linea in range(0, 360, 45):
+        rad = math.radians(angulo_linea)
+        x2 = int(cx + (4.2 * pixels_por_10_grados) * math.cos(rad))
+        y2 = int(cy + (4.2 * pixels_por_10_grados) * math.sin(rad))
+        cv2.line(img_heatmap, (cx, cy), (x2, y2), (0, 0, 255), 1)
+
+    porcentaje_perdida_cv = (grados_no_vistos_total / 320.0) * 100
+    incapacidad_ojo = porcentaje_perdida_cv * 0.25
+
+    return img_heatmap, grados_no_vistos_total, incapacidad_ojo
+
+# ==========================================
