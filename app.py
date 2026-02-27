@@ -27,7 +27,7 @@ def procesar_campo_visual(image_bytes):
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
     # --- A. CALIBRACIÓN GEOMÉTRICA BLINDADA ---
-    # Enmascaramos (borramos) el 25% inferior para que la tabla no confunda a los ejes
+    # Enmascaramos el 25% inferior para que la tabla no confunda a los ejes
     mask_ejes = thresh.copy()
     limite_inferior = int(alto * 0.75)
     mask_ejes[limite_inferior:, :] = 0 
@@ -46,21 +46,19 @@ def procesar_campo_visual(image_bytes):
     else:
         cx, cy = int(ancho / 2), int(alto / 2)
         
-    # Calcular escala (solo buscando en la mitad derecha del eje horizontal)
     fila_eje_h = lineas_h[cy-5 : cy+5, cx:] 
     _, x_h = np.where(fila_eje_h > 0)
     if len(x_h) > 0:
-        dist_60 = np.max(x_h) # Distancia desde el centro al borde de la línea
+        dist_60 = np.max(x_h) 
         pixels_por_10_grados = dist_60 / 6.0
     else:
         dist_60 = int((ancho - cx) * 0.75)
         pixels_por_10_grados = dist_60 / 6.0
     
-    # --- B. DETECCIÓN DE SÍMBOLOS (ÍNDICE DE RELLENO / EXTENT) ---
+    # --- B. DETECCIÓN DE SÍMBOLOS CON EVALUACIÓN EN IMAGEN ORIGINAL ---
     
-    # Restamos las líneas de los ejes para que no se peguen a los cuadraditos
+    # Restamos las líneas SOLO para encontrar las coordenadas sin que se peguen los símbolos
     thresh_sin_ejes = cv2.subtract(thresh, cv2.bitwise_or(lineas_h, lineas_v))
-    
     contornos, _ = cv2.findContours(thresh_sin_ejes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     puntos_totales = []
     
@@ -71,86 +69,13 @@ def procesar_campo_visual(image_bytes):
         area_caja = w * h
         aspect_ratio = float(w)/h if h > 0 else 0
         
-        # Filtramos ruido minúsculo y objetos gigantes
         if 8 < area_caja < max_area_esperada and 0.4 < aspect_ratio < 2.5:
             
-            # MAGIA MATEMÁTICA: Calculamos qué porcentaje de la caja tiene tinta
-            roi = thresh_sin_ejes[y:y+h, x:x+w]
-            pixeles_tinta = cv2.countNonZero(roi)
-            indice_relleno = pixeles_tinta / float(area_caja)
-            
-            px, py = x + w//2, y + h//2
-            dx, dy = px - cx, py - cy
-            radio_pixel = math.hypot(dx, dy)
-            grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
-            
-            if 2 < grados_fisicos <= 41: # Ignoramos el centro exacto
-                angulo = math.degrees(math.atan2(dy, dx))
-                if angulo < 0: angulo += 360
-                
-                # REGLA DE CLASIFICACIÓN
-                if indice_relleno > 0.55: # Más del 55% lleno de tinta = Cuadrado
-                    tipo = 'fallado'
-                    cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo
-                else:                     # Menos del 55% (tiene hueco) = Círculo
-                    tipo = 'visto'
-                    cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde
-                    
-                puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
-
-    # --- C. ANÁLISIS POR ZONAS Y MAPA DE CALOR ---
-    grados_no_vistos_total = 0
-    
-    for i in range(1, 5):
-        radio_dibujo = int(i * pixels_por_10_grados)
-        cv2.circle(img_heatmap, (cx, cy), radio_dibujo, (0, 0, 255), 1)
-        
-    for anillo in range(4):
-        limite_inf = anillo * 10
-        limite_sup = (anillo + 1) * 10
-        
-        for octante in range(8):
-            ang_inf = octante * 45
-            ang_sup = (octante + 1) * 45
-            
-            puntos_zona = [p for p in puntos_totales if limite_inf <= p['r'] < limite_sup and ang_inf <= p['ang'] < ang_sup]
-            
-            total_pts = len(puntos_zona)
-            fallados = sum(1 for p in puntos_zona if p['tipo'] == 'fallado')
-            
-            color_zona = None
-            grados_perdidos = 0
-            
-            if total_pts > 0:
-                densidad = (fallados / total_pts) * 100
-                
-                if densidad >= 70:
-                    grados_perdidos = 10
-                    color_zona = (255, 200, 0) # Celeste
-                elif 0 < densidad < 70:
-                    grados_perdidos = 5
-                    color_zona = (0, 255, 255) # Amarillo
-            
-            grados_no_vistos_total += grados_perdidos
-            
-            if color_zona:
-                r_in = int(limite_inf * (pixels_por_10_grados/10))
-                r_out = int(limite_sup * (pixels_por_10_grados/10))
-                cv2.ellipse(overlay, (cx, cy), (r_out, r_out), 0, ang_inf, ang_sup, color_zona, -1)
-                cv2.ellipse(overlay, (cx, cy), (r_in, r_in), 0, ang_inf, ang_sup, (255, 255, 255), -1)
-
-    cv2.addWeighted(overlay, 0.4, img_heatmap, 0.6, 0, img_heatmap)
-    
-    for angulo_linea in range(0, 360, 45):
-        rad = math.radians(angulo_linea)
-        x2 = int(cx + (4.2 * pixels_por_10_grados) * math.cos(rad))
-        y2 = int(cy + (4.2 * pixels_por_10_grados) * math.sin(rad))
-        cv2.line(img_heatmap, (cx, cy), (x2, y2), (0, 0, 255), 1)
-
-    porcentaje_perdida_cv = (grados_no_vistos_total / 320.0) * 100
-    incapacidad_ojo = porcentaje_perdida_cv * 0.25
-
-    return img_heatmap, grados_no_vistos_total, incapacidad_ojo
+            # MAGIA: Evaluamos el contenido mirando la imagen ORIGINAL (thresh)
+            # Así los cuadrados centrales no pierden su "tinta" por culpa de los ejes
+            roi_original = thresh[y:y+h, x:x+w]
+            pixeles_tinta = cv2.countNonZero(roi_original)
+            indice_relleno = pixeles_
 # ==========================================
 # 2. INTERFAZ DE USUARIO (WEB APP)
 # ==========================================
