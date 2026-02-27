@@ -63,7 +63,6 @@ def procesar_campo_visual(image_bytes):
         
         puntos_zona = {a: {o: {'v':0, 'f':0} for o in range(8)} for a in range(4)}
         
-        # ERROR CORREGIDO AQUÍ: Volvemos al cálculo de tamaño adaptativo (no fijo a 400)
         area_min = (ancho * 0.002) ** 2
         area_max = (ancho * 0.025) ** 2
         
@@ -84,105 +83,4 @@ def procesar_campo_visual(image_bytes):
                 y1, y2 = int(h*0.3), int(h*0.7)
                 x1, x2 = int(w*0.3), int(w*0.7)
                 
-                if y2 > y1 and x2 > x1:
-                    corazon = roi[y1:y2, x1:x2]
-                    densidad_tinta = cv2.countNonZero(corazon) / float(corazon.size)
-                    tipo = 'fallado' if densidad_tinta > 0.45 else 'visto'
-                    
-                    r_deg = (math.hypot(dx, dy) / pixels_por_10_grados) * 10.0
-                    
-                    if 2 <= r_deg <= 41:
-                        ang = (math.degrees(math.atan2(dy, dx)) + 360.001) % 360
-                        anillo = min(3, int(r_deg // 10))
-                        octante = min(7, int(ang // 45))
-                        
-                        if tipo == 'fallado':
-                            puntos_zona[anillo][octante]['f'] += 1
-                            cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1)
-                        else:
-                            puntos_zona[anillo][octante]['v'] += 1
-                            cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1)
-
-        # 4. PINTURA DE OCTANTES
-        overlay = np.zeros_like(img, dtype=np.uint8)
-        grados_no_vistos = 0
-        
-        for a in range(4):
-            r_in = int(a * pixels_por_10_grados)
-            r_out = int((a + 1) * pixels_por_10_grados)
-            
-            for o in range(8):
-                ang_in, ang_out = o * 45, (o + 1) * 45
-                f = puntos_zona[a][o]['f']
-                v = puntos_zona[a][o]['v']
-                
-                if (f + v) > 0:
-                    pct = (f / float(f + v)) * 100
-                    color = None
-                    if pct >= 70:
-                        color = (255, 200, 0) # Celeste
-                        grados_no_vistos += 10
-                    elif pct > 0:
-                        color = (0, 255, 255) # Amarillo
-                        grados_no_vistos += 5
-                        
-                    if color:
-                        mask = np.zeros((alto, ancho), dtype=np.uint8)
-                        cv2.ellipse(mask, (cx, cy), (r_out, r_out), 0, ang_in, ang_out, 255, -1)
-                        if r_in > 0:
-                            cv2.ellipse(mask, (cx, cy), (r_in, r_in), 0, ang_in, ang_out, 0, -1)
-                        overlay[mask == 255] = color
-
-        gray_mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
-        alpha = 0.5
-        for c in range(3):
-            img_heatmap[:,:,c] = np.where(gray_mask > 0, 
-                                          img_heatmap[:,:,c] * (1 - alpha) + overlay[:,:,c] * alpha, 
-                                          img_heatmap[:,:,c])
-
-        # Dibujar grilla final
-        for i in range(1, 5):
-            cv2.circle(img_heatmap, (cx, cy), int(i * pixels_por_10_grados), (0, 0, 255), 1)
-        for i in range(8):
-            rad = math.radians(i * 45)
-            x2 = int(cx + 4.2 * pixels_por_10_grados * math.cos(rad))
-            y2 = int(cy + 4.2 * pixels_por_10_grados * math.sin(rad))
-            cv2.line(img_heatmap, (cx, cy), (x2, y2), (0, 0, 255), 1)
-
-        incapacidad = (grados_no_vistos / 320.0) * 100 * 0.25
-        return img_heatmap, grados_no_vistos, incapacidad, None
-
-    except Exception as e:
-        return None, 0, 0, traceback.format_exc()
-
-# ==========================================
-# INTERFAZ WEB
-# ==========================================
-
-st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
-st.markdown("""
-**Versión Activa:** Filtro Fantasma + Detección Dinámica Restaurada.
-- **Puntos Rojos:** Cuadrados (Fallados).
-- **Puntos Verdes:** Círculos (Vistos).
-- **Celeste:** Densidad ≥ 70% (10°). **Amarillo:** > 0% (5°).
-""")
-
-modo_evaluacion = st.radio("Seleccione el tipo de evaluación:", ["Unilateral (Un solo ojo)", "Bilateral (Ambos ojos)"], key="radio_final_pro")
-
-col1, col2 = st.columns(2)
-
-def mostrar_resultado(columna, titulo, key_uploader):
-    with columna:
-        st.subheader(titulo)
-        file = st.file_uploader(f"Subir imagen {titulo}", type=["jpg", "jpeg", "png"], key=key_uploader)
-        if file is not None:
-            with st.spinner("Procesando matriz definitiva..."):
-                img_res, grados, incap, error_msg = procesar_campo_visual(file.getvalue())
-            
-            if error_msg:
-                st.error("Error del sistema:")
-                st.code(error_msg)
-                return 0.0
-            elif img_res is not None:
-                img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
-                st.image(Image.fromarray(img_rgb), caption=f"Mapa de Calor -
+                if y2 > y1 and x2 > x
