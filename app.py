@@ -20,18 +20,14 @@ def procesar_campo_visual(image_bytes):
 
     img_heatmap = img.copy()
     overlay = img.copy()
-    
-    # Conservamos la imagen en grises ORIGINAL e INTACTA para medir la luz
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     alto, ancho = gray.shape
     
-    # Binarización solo usada como "radar" para encontrar coordenadas
-    _, thresh_radar = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # --- A. CALIBRACIÓN GEOMÉTRICA BLINDADA ---
-    mask_ejes = thresh_radar.copy()
+    # --- A. CALIBRACIÓN GEOMÉTRICA (Usando OTSU global para buscar los ejes) ---
+    _, thresh_global = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    mask_ejes = thresh_global.copy()
     limite_inferior = int(alto * 0.75)
-    mask_ejes[limite_inferior:, :] = 0 # Ocultar la tabla inferior
+    mask_ejes[limite_inferior:, :] = 0 # Ocultar tabla inferior
     
     kernel_h_axis = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho * 0.2), 1))
     lineas_h = cv2.morphologyEx(mask_ejes, cv2.MORPH_OPEN, kernel_h_axis)
@@ -56,10 +52,18 @@ def procesar_campo_visual(image_bytes):
         dist_60 = int((ancho - cx) * 0.75)
         pixels_por_10_grados = dist_60 / 6.0
     
-    # --- B. DETECCIÓN POR ANÁLISIS FOTOMÉTRICO (LA OPCIÓN SUPERIOR) ---
+    # --- B. DETECCIÓN DE SÍMBOLOS (VISIÓN ADAPTATIVA) ---
     
-    # Restamos las líneas de los ejes del "radar"
-    thresh_sin_ejes = cv2.subtract(thresh_radar, cv2.bitwise_or(lineas_h, lineas_v))
+    # MAGIA: Adaptive Threshold se ajusta a las "zonas grises" y variaciones de luz del centro
+    thresh_local = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 12)
+    
+    # Engrosamos los ejes un poco para asegurar que "corten" bien los símbolos al restarlos
+    ejes_unidos = cv2.bitwise_or(lineas_h, lineas_v)
+    kernel_corte = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    ejes_gruesos = cv2.dilate(ejes_unidos, kernel_corte)
+    
+    # Restamos los ejes para dejar los símbolos sueltos (aunque tengan un "hueco" de la línea restada)
+    thresh_sin_ejes = cv2.subtract(thresh_local, ejes_gruesos)
     contornos, _ = cv2.findContours(thresh_sin_ejes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     puntos_totales = []
     
@@ -70,44 +74,33 @@ def procesar_campo_visual(image_bytes):
         area_caja = w * h
         aspect_ratio = float(w)/h if h > 0 else 0
         
-        # Si la caja tiene tamaño de símbolo...
+        # Filtramos ruido minúsculo
         if 8 < area_caja < max_area_esperada and 0.4 < aspect_ratio < 2.5:
             
-            # --- ANÁLISIS DE LUZ EN LA IMAGEN ORIGINAL ---
-            # Recortamos el símbolo en la imagen gris real (sin modificaciones)
-            roi_gris_real = gray[y:y+h, x:x+w]
+            # Calculamos cuánta tinta quedó en esa cajita
+            roi = thresh_sin_ejes[y:y+h, x:x+w]
+            pixeles_tinta = cv2.countNonZero(roi)
+            indice_relleno = pixeles_tinta / float(area_caja)
             
-            # Apuntamos exactamente al núcleo (el centro matemático del símbolo)
-            # Evitamos los bordes donde el círculo tiene tinta negra
-            nucleo_y1, nucleo_y2 = int(h * 0.35), int(h * 0.65)
-            nucleo_x1, nucleo_x2 = int(w * 0.35), int(w * 0.65)
+            px, py = x + w//2, y + h//2
+            dx, dy = px - cx, py - cy
+            radio_pixel = math.hypot(dx, dy)
+            grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
             
-            if nucleo_y2 > nucleo_y1 and nucleo_x2 > nucleo_x1:
-                nucleo = roi_gris_real[nucleo_y1:nucleo_y2, nucleo_x1:nucleo_x2]
+            if 2 < grados_fisicos <= 41:
+                angulo = math.degrees(math.atan2(dy, dx))
+                if angulo < 0: angulo += 360
                 
-                # Medimos la luz promedio del núcleo (0 es negro puro, 255 es blanco puro)
-                luz_promedio = np.mean(nucleo)
-                
-                px, py = x + w//2, y + h//2
-                dx, dy = px - cx, py - cy
-                radio_pixel = math.hypot(dx, dy)
-                grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
-                
-                if 2 < grados_fisicos <= 41:
-                    angulo = math.degrees(math.atan2(dy, dx))
-                    if angulo < 0: angulo += 360
+                # REGLA: Un círculo hueco ronda el 20-30% de relleno. 
+                # Un cuadrado, aún con la cruz del eje borrada, supera el 45-50%.
+                if indice_relleno >= 0.45: 
+                    tipo = 'fallado'
+                    cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo
+                else:                     
+                    tipo = 'visto'
+                    cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde
                     
-                    # REGLA FOTOMÉTRICA INQUEBRANTABLE:
-                    # Si la luz es menor a 130 (zona oscura/tinta), es un Cuadrado.
-                    if luz_promedio < 130: 
-                        tipo = 'fallado'
-                        cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo
-                    else:                     
-                        # Si es mayor (refleja el papel blanco), es un Círculo.
-                        tipo = 'visto'
-                        cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde
-                        
-                    puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
+                puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
 
     # --- C. ANÁLISIS POR ZONAS Y MAPA DE CALOR ---
     grados_no_vistos_total = 0
