@@ -69,7 +69,8 @@ def procesar_campo_visual(image_bytes):
                 
                 if y2 > y1 and x2 > x1:
                     corazon = thresh[y+y1:y+y2, x+x1:x+x2]
-                    densidad_tinta = np.countNonZero(corazon) / float(corazon.size)
+                    # CORRECCIÓN DE ERROR APLICADA AQUÍ: cv2.countNonZero
+                    densidad_tinta = cv2.countNonZero(corazon) / float(corazon.size)
                     
                     tipo = 'fallado' if densidad_tinta > 0.45 else 'visto'
                     simbolos_validos.append({'px': px, 'py': py, 'tipo': tipo})
