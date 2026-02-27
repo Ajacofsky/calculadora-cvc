@@ -8,7 +8,7 @@ import traceback
 st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
 
 # ==========================================
-# MOTOR DE VISIÓN (MOTOR ORO + FILTRO FANTASMA)
+# MOTOR ORO: DETECCIÓN EXACTA + ESCALA DE PUNTOS
 # ==========================================
 
 def procesar_campo_visual(image_bytes):
@@ -27,9 +27,9 @@ def procesar_campo_visual(image_bytes):
         # 1. BINARIZACIÓN
         _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
         
-        # 2. CENTRO Y ESCALA
+        # 2. CENTRO (Cruz Morfológica)
         mask_ejes = thresh.copy()
-        mask_ejes[int(alto*0.75):, :] = 0 # Ocultar tabla inferior
+        mask_ejes[int(alto*0.75):, :] = 0 
         
         kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho*0.15), 1))
         kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(alto*0.15)))
@@ -43,16 +43,8 @@ def procesar_campo_visual(image_bytes):
             cx, cy = int(np.mean(x_coords)), int(np.mean(y_coords))
         else:
             cx, cy = ancho//2, alto//2
-            
-        eje_derecho = lineas_h[cy-5:cy+5, cx:]
-        _, x_h = np.where(eje_derecho > 0)
-        dist_60 = np.max(x_h) if len(x_h) > 0 else (ancho - cx)*0.75
-        pixels_por_10_grados = float(dist_60 / 6.0)
 
-        # Margen físico para ignorar la cruz y sus marquitas
-        margen_eje = pixels_por_10_grados * 0.15
-
-        # 3. DETECCIÓN (Motor Original Restaurado a Dinámico)
+        # 3. AISLAR SÍMBOLOS (Motor Oro)
         grilla = cv2.bitwise_or(lineas_h, lineas_v)
         grilla_dilatada = cv2.dilate(grilla, np.ones((3,3), np.uint8))
         
@@ -61,24 +53,21 @@ def procesar_campo_visual(image_bytes):
         
         contornos, _ = cv2.findContours(simbolos_aislados, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        puntos_zona = {a: {o: {'v':0, 'f':0} for o in range(8)} for a in range(4)}
-        
+        simbolos_validos = []
         area_min = (ancho * 0.002) ** 2
         area_max = (ancho * 0.025) ** 2
         
         for cnt in contornos:
             x, y, w, h = cv2.boundingRect(cnt)
-            area = w * h
-            aspect_ratio = w / float(h) if h > 0 else 0
-            
-            if area_min < area < area_max and 0.4 < aspect_ratio < 2.5:
+            if area_min < w*h < area_max and 0.4 < w/float(h) < 2.5:
                 px, py = x + w//2, y + h//2
                 dx, dy = px - cx, py - cy
                 
-                # FILTRO FANTASMA: Si toca el eje central, se ignora
-                if abs(dx) < margen_eje or abs(dy) < margen_eje:
+                # FILTRO FANTASMA: Ignorar marcas pegadas a la cruz (Mancha ciega o regla)
+                if abs(dx) < 8 or abs(dy) < 8:
                     continue
                 
+                # Núcleo 40% (El diferencial del Motor Oro)
                 roi = thresh[y:y+h, x:x+w]
                 y1, y2 = int(h*0.3), int(h*0.7)
                 x1, x2 = int(w*0.3), int(w*0.7)
@@ -87,22 +76,47 @@ def procesar_campo_visual(image_bytes):
                     corazon = roi[y1:y2, x1:x2]
                     densidad_tinta = cv2.countNonZero(corazon) / float(corazon.size)
                     tipo = 'fallado' if densidad_tinta > 0.45 else 'visto'
-                    
-                    r_deg = (math.hypot(dx, dy) / pixels_por_10_grados) * 10.0
-                    
-                    if 2 <= r_deg <= 41:
-                        ang = (math.degrees(math.atan2(dy, dx)) + 360.001) % 360
-                        anillo = min(3, int(r_deg // 10))
-                        octante = min(7, int(ang // 45))
-                        
-                        if tipo == 'fallado':
-                            puntos_zona[anillo][octante]['f'] += 1
-                            cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1)
-                        else:
-                            puntos_zona[anillo][octante]['v'] += 1
-                            cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1)
+                    simbolos_validos.append({'px': px, 'py': py, 'tipo': tipo})
 
-        # 4. PINTURA DE OCTANTES
+        # 4. LA ESCALA INFALIBLE (Mediana de vecinos = 6 grados)
+        distancias = []
+        for i, s1 in enumerate(simbolos_validos):
+            min_d = float('inf')
+            for j, s2 in enumerate(simbolos_validos):
+                if i != j:
+                    d = math.hypot(s1['px'] - s2['px'], s1['py'] - s2['py'])
+                    if d > 8: # Ignorar fragmentos del mismo punto
+                        if d < min_d: min_d = d
+            if min_d != float('inf'):
+                distancias.append(min_d)
+                
+        if len(distancias) > 10:
+            pixeles_por_6_grados = np.median(distancias)
+            pixels_por_10_grados = float((pixeles_por_6_grados / 6.0) * 10.0)
+        else:
+            pixels_por_10_grados = float(ancho * 0.05) # Salvavidas
+
+        # 5. CONTEO ESTRICTO DE 40 GRADOS Y PINTURA
+        puntos_zona = {a: {o: {'v':0, 'f':0} for o in range(8)} for a in range(4)}
+        
+        for sim in simbolos_validos:
+            dx, dy = sim['px'] - cx, sim['py'] - cy
+            r_deg = (math.hypot(dx, dy) / pixels_por_10_grados) * 10.0
+            
+            if 2 <= r_deg <= 41:
+                # El 360.001 evita que puntos exactos en el borde cambien de octante
+                ang = (math.degrees(math.atan2(dy, dx)) + 360.001) % 360
+                anillo = min(3, int(r_deg // 10))
+                octante = min(7, int(ang // 45))
+                
+                if sim['tipo'] == 'fallado':
+                    puntos_zona[anillo][octante]['f'] += 1
+                    cv2.circle(img_heatmap, (sim['px'], sim['py']), 4, (0, 0, 255), -1)
+                else:
+                    puntos_zona[anillo][octante]['v'] += 1
+                    cv2.circle(img_heatmap, (sim['px'], sim['py']), 2, (0, 255, 0), -1)
+
+        # 6. REGLA DEL 70% APLICADA SOBRE ANILLOS PRECISOS
         overlay = np.zeros_like(img, dtype=np.uint8)
         grados_no_vistos = 0
         
@@ -119,10 +133,10 @@ def procesar_campo_visual(image_bytes):
                     pct = (f / float(f + v)) * 100
                     color = None
                     if pct >= 70:
-                        color = (255, 200, 0) # Celeste
+                        color = (255, 200, 0) # Celeste BGR
                         grados_no_vistos += 10
                     elif pct > 0:
-                        color = (0, 255, 255) # Amarillo
+                        color = (0, 255, 255) # Amarillo BGR
                         grados_no_vistos += 5
                         
                     if color:
@@ -132,6 +146,7 @@ def procesar_campo_visual(image_bytes):
                             cv2.ellipse(mask, (cx, cy), (r_in, r_in), 0, ang_in, ang_out, 0, -1)
                         overlay[mask == 255] = color
 
+        # Fusión visual
         gray_mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
         alpha = 0.5
         for c in range(3):
@@ -139,7 +154,7 @@ def procesar_campo_visual(image_bytes):
                                           img_heatmap[:,:,c] * (1 - alpha) + overlay[:,:,c] * alpha, 
                                           img_heatmap[:,:,c])
 
-        # Dibujar grilla final
+        # Dibujar anillos de auditoría
         for i in range(1, 5):
             cv2.circle(img_heatmap, (cx, cy), int(i * pixels_por_10_grados), (0, 0, 255), 1)
         for i in range(8):
@@ -160,7 +175,7 @@ def procesar_campo_visual(image_bytes):
 
 st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
 st.markdown("""
-**Versión Activa:** Filtro Fantasma + Detección Dinámica Restaurada.
+**Programa Activo:** Motor Oro Original + Escala Estructural de 6°.
 - **Puntos Rojos:** Cuadrados (Fallados).
 - **Puntos Verdes:** Círculos (Vistos).
 - **Celeste:** Densidad ≥ 70% (10°). **Amarillo:** > 0% (5°).
