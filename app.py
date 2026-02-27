@@ -23,11 +23,13 @@ def procesar_campo_visual(image_bytes):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     alto, ancho = gray.shape
     
-    # --- A. CALIBRACIÓN GEOMÉTRICA (Usando OTSU global para buscar los ejes) ---
-    _, thresh_global = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    mask_ejes = thresh_global.copy()
+    # 1. BINARIZACIÓN ADAPTATIVA (Inmune a los centros iluminados/grises)
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 8)
+    
+    # --- A. CALIBRACIÓN GEOMÉTRICA BLINDADA ---
+    mask_ejes = thresh.copy()
     limite_inferior = int(alto * 0.75)
-    mask_ejes[limite_inferior:, :] = 0 # Ocultar tabla inferior
+    mask_ejes[limite_inferior:, :] = 0 
     
     kernel_h_axis = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho * 0.2), 1))
     lineas_h = cv2.morphologyEx(mask_ejes, cv2.MORPH_OPEN, kernel_h_axis)
@@ -51,56 +53,82 @@ def procesar_campo_visual(image_bytes):
     else:
         dist_60 = int((ancho - cx) * 0.75)
         pixels_por_10_grados = dist_60 / 6.0
+
+    # --- B. EXTRACCIÓN MORFOLÓGICA DE SÍMBOLOS (NMS) ---
     
-    # --- B. DETECCIÓN DE SÍMBOLOS (VISIÓN ADAPTATIVA) ---
+    # PASO 1: Aislar SÓLO los cuadrados macizos (Destruyendo líneas finas y círculos)
+    kernel_sq = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    solo_cuadrados = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_sq)
     
-    # MAGIA: Adaptive Threshold se ajusta a las "zonas grises" y variaciones de luz del centro
-    thresh_local = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 12)
+    contornos_sq, _ = cv2.findContours(solo_cuadrados, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    puntos_fallados_raw = []
     
-    # Engrosamos los ejes un poco para asegurar que "corten" bien los símbolos al restarlos
+    for cnt in contornos_sq:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w * h > 6: # Filtro de ruido
+            px, py = x + w//2, y + h//2
+            puntos_fallados_raw.append((px, py))
+
+    # PASO 2: Restar ejes para buscar los círculos sin falsos positivos
     ejes_unidos = cv2.bitwise_or(lineas_h, lineas_v)
-    kernel_corte = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    ejes_gruesos = cv2.dilate(ejes_unidos, kernel_corte)
+    ejes_gruesos = cv2.dilate(ejes_unidos, cv2.getStructuringElement(cv2.MORPH_RECT, (3,3)))
+    thresh_sin_ejes = cv2.subtract(thresh, ejes_gruesos)
     
-    # Restamos los ejes para dejar los símbolos sueltos (aunque tengan un "hueco" de la línea restada)
-    thresh_sin_ejes = cv2.subtract(thresh_local, ejes_gruesos)
-    contornos, _ = cv2.findContours(thresh_sin_ejes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    puntos_totales = []
+    contornos_restantes, _ = cv2.findContours(thresh_sin_ejes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    puntos_vistos_raw = []
     
+    # Radio de seguridad para agrupar fragmentos del mismo símbolo
+    radio_nms = pixels_por_10_grados * 0.3 
     max_area_esperada = (pixels_por_10_grados * 0.8) ** 2
     
-    for cnt in contornos:
+    for cnt in contornos_restantes:
         x, y, w, h = cv2.boundingRect(cnt)
-        area_caja = w * h
-        aspect_ratio = float(w)/h if h > 0 else 0
+        area = w * h
+        aspect = float(w)/h if h > 0 else 0
         
-        # Filtramos ruido minúsculo
-        if 8 < area_caja < max_area_esperada and 0.4 < aspect_ratio < 2.5:
-            
-            # Calculamos cuánta tinta quedó en esa cajita
-            roi = thresh_sin_ejes[y:y+h, x:x+w]
-            pixeles_tinta = cv2.countNonZero(roi)
-            indice_relleno = pixeles_tinta / float(area_caja)
-            
+        if 4 < area < max_area_esperada and 0.2 < aspect < 5.0:
             px, py = x + w//2, y + h//2
-            dx, dy = px - cx, py - cy
-            radio_pixel = math.hypot(dx, dy)
-            grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
             
-            if 2 < grados_fisicos <= 41:
-                angulo = math.degrees(math.atan2(dy, dx))
-                if angulo < 0: angulo += 360
+            # 1. ¿Es un pedazo de un cuadrado ya detectado en el PASO 1?
+            es_cuadrado = False
+            for (sq_x, sq_y) in puntos_fallados_raw:
+                if math.hypot(px - sq_x, py - sq_y) < radio_nms:
+                    es_cuadrado = True
+                    break
+            
+            if not es_cuadrado:
+                # 2. ¿Es un fragmento de un círculo ya contado? (Agrupación NMS)
+                es_nuevo = True
+                for (v_x, v_y) in puntos_vistos_raw:
+                    if math.hypot(px - v_x, py - v_y) < radio_nms:
+                        es_nuevo = False
+                        break
                 
-                # REGLA: Un círculo hueco ronda el 20-30% de relleno. 
-                # Un cuadrado, aún con la cruz del eje borrada, supera el 45-50%.
-                if indice_relleno >= 0.45: 
-                    tipo = 'fallado'
-                    cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo
-                else:                     
-                    tipo = 'visto'
-                    cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde
-                    
-                puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
+                if es_nuevo:
+                    puntos_vistos_raw.append((px, py))
+
+    # PASO 3: Filtrar por zona útil clínica (<= 41 grados) y dibujar auditoría
+    puntos_totales = []
+    
+    for px, py in puntos_fallados_raw:
+        dx, dy = px - cx, py - cy
+        r_pixel = math.hypot(dx, dy)
+        g_fisicos = (r_pixel / pixels_por_10_grados) * 10
+        if 2 < g_fisicos <= 41:
+            ang = math.degrees(math.atan2(dy, dx))
+            if ang < 0: ang += 360
+            puntos_totales.append({'r': g_fisicos, 'ang': ang, 'tipo': 'fallado'})
+            cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo Auditoría
+
+    for px, py in puntos_vistos_raw:
+        dx, dy = px - cx, py - cy
+        r_pixel = math.hypot(dx, dy)
+        g_fisicos = (r_pixel / pixels_por_10_grados) * 10
+        if 2 < g_fisicos <= 41:
+            ang = math.degrees(math.atan2(dy, dx))
+            if ang < 0: ang += 360
+            puntos_totales.append({'r': g_fisicos, 'ang': ang, 'tipo': 'visto'})
+            cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde Auditoría
 
     # --- C. ANÁLISIS POR ZONAS Y MAPA DE CALOR ---
     grados_no_vistos_total = 0
@@ -164,13 +192,12 @@ st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
 
 st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
 st.markdown("""
-**Método de Análisis:** Detección morfológica con evaluación original.
+**Método de Análisis:** Aislamiento Morfológico y Supresión de No-Máximos (NMS).
 - **Puntos Rojos:** Cuadrados negros detectados (Fallados).
 - **Puntos Verdes:** Círculos detectados (Vistos).
-- **Regla:** Densidad ≥ 70% = 10° (Celeste) | > 0% = 5° (Amarillo).
 """)
 
-modo_evaluacion = st.radio("Seleccione el tipo de evaluación:", ["Unilateral (Un solo ojo)", "Bilateral (Ambos ojos)"], key="radio_modo_v4")
+modo_evaluacion = st.radio("Seleccione el tipo de evaluación:", ["Unilateral (Un solo ojo)", "Bilateral (Ambos ojos)"], key="modo_radio_final")
 
 col1, col2 = st.columns(2)
 
@@ -179,25 +206,25 @@ def mostrar_resultado(columna, titulo, key_uploader):
         st.subheader(titulo)
         file = st.file_uploader(f"Subir imagen {titulo}", type=["jpg", "jpeg", "png"], key=key_uploader)
         if file is not None:
-            with st.spinner("Procesando imagen con algoritmo avanzado..."):
+            with st.spinner("Procesando mapa de densidades..."):
                 img_res, grados, incap = procesar_campo_visual(file.getvalue())
             
             if img_res is not None:
                 img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(img_rgb)
-                st.image(pil_img, caption=f"Auditoría y Mapa de Calor - {titulo}", use_container_width=True)
+                st.image(pil_img, caption=f"Mapa de Calor - {titulo}", use_container_width=True)
                 st.success(f"**Grados No Vistos:** {grados}° / 320°")
                 st.metric(label=f"Incapacidad {titulo}", value=f"{incap:.2f}%")
                 return incap
             else:
-                st.error("Error al procesar. Verifique el formato de la imagen.")
+                st.error("Error al procesar.")
     return 0.0
 
-incap_OD = mostrar_resultado(col1, "Ojo Derecho (OD)", "file_od")
+incap_OD = mostrar_resultado(col1, "Ojo Derecho (OD)", "od_file")
 incap_OI = 0.0
 
 if modo_evaluacion == "Bilateral (Ambos ojos)":
-    incap_OI = mostrar_resultado(col2, "Ojo Izquierdo (OI)", "file_oi")
+    incap_OI = mostrar_resultado(col2, "Ojo Izquierdo (OI)", "oi_file")
 
 # ==========================================
 # 3. RESULTADO FINAL LEGAL
