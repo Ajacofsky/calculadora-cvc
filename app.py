@@ -8,7 +8,7 @@ import traceback
 st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
 
 # ==========================================
-# MOTOR DE VISIÓN (GRILLA ORIGINAL + FILTRO FANTASMA)
+# MOTOR DE VISIÓN (GRILLA ORIGINAL + DENSIDAD TOTAL)
 # ==========================================
 
 def procesar_campo_visual(image_bytes):
@@ -27,7 +27,7 @@ def procesar_campo_visual(image_bytes):
         # 1. BINARIZACIÓN
         _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
         
-        # 2. CENTRO Y ESCALA (LA GRILLA EXACTA QUE FUNCIONABA)
+        # 2. CENTRO Y ESCALA (LA GRILLA EXACTA QUE FUNCIONA)
         mask_ejes = thresh.copy()
         mask_ejes[int(alto*0.75):, :] = 0 # Ocultar tabla inferior
         
@@ -48,13 +48,10 @@ def procesar_campo_visual(image_bytes):
         _, x_h = np.where(eje_derecho > 0)
         dist_60 = np.max(x_h) if len(x_h) > 0 else (ancho - cx)*0.75
         
-        # EL CÁLCULO ORIGINAL QUE NO DEBÍ TOCAR
         pixels_por_10_grados = float(dist_60 / 6.0)
+        margen_eje = pixels_por_10_grados * 0.15 # Filtro para ignorar la cruz central
 
-        # Margen físico para ignorar la cruz y sus marquitas
-        margen_eje = pixels_por_10_grados * 0.15
-
-        # 3. DETECCIÓN (Motor de Núcleo del 40%)
+        # 3. DETECCIÓN (Método de Densidad Total de Caja)
         grilla = cv2.bitwise_or(lineas_h, lineas_v)
         grilla_dilatada = cv2.dilate(grilla, np.ones((3,3), np.uint8))
         
@@ -77,32 +74,33 @@ def procesar_campo_visual(image_bytes):
                 px, py = x + w//2, y + h//2
                 dx, dy = px - cx, py - cy
                 
-                # FILTRO FANTASMA: Si toca el eje central, se ignora
+                # Ignorar si está tocando la cruz central (marcas de regla)
                 if abs(dx) < margen_eje or abs(dy) < margen_eje:
                     continue
                 
+                # REGLA MAESTRA: Se extrae la caja entera de la imagen original
                 roi = thresh[y:y+h, x:x+w]
-                y1, y2 = int(h*0.3), int(h*0.7)
-                x1, x2 = int(w*0.3), int(w*0.7)
                 
-                if y2 > y1 and x2 > x1:
-                    corazon = roi[y1:y2, x1:x2]
-                    densidad_tinta = cv2.countNonZero(corazon) / float(corazon.size)
-                    tipo = 'fallado' if densidad_tinta > 0.45 else 'visto'
+                # Si más del 60% de la caja es negra, es un cuadrado macizo. Si es menos, es un círculo hueco.
+                densidad_total = cv2.countNonZero(roi) / float(w * h)
+                tipo = 'fallado' if densidad_total > 0.60 else 'visto'
+                
+                r_deg = (math.hypot(dx, dy) / pixels_por_10_grados) * 10.0
+                
+                # Filtrar a los 40 grados periciales
+                if 1 <= r_deg <= 41:
+                    ang = (math.degrees(math.atan2(dy, dx)) + 360.001) % 360
+                    anillo = min(3, int(r_deg // 10))
+                    octante = min(7, int(ang // 45))
                     
-                    r_deg = (math.hypot(dx, dy) / pixels_por_10_grados) * 10.0
-                    
-                    if 1 <= r_deg <= 41:
-                        ang = (math.degrees(math.atan2(dy, dx)) + 360.001) % 360
-                        anillo = min(3, int(r_deg // 10))
-                        octante = min(7, int(ang // 45))
-                        
-                        if tipo == 'fallado':
-                            puntos_zona[anillo][octante]['f'] += 1
-                            cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1)
-                        else:
-                            puntos_zona[anillo][octante]['v'] += 1
-                            cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1)
+                    if tipo == 'fallado':
+                        puntos_zona[anillo][octante]['f'] += 1
+                        # Puntito rojo pequeño y limpio
+                        cv2.circle(img_heatmap, (px, py), 2, (0, 0, 255), -1)
+                    else:
+                        puntos_zona[anillo][octante]['v'] += 1
+                        # Puntito verde pequeño y limpio
+                        cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1)
 
         # 4. PINTURA DE OCTANTES (Regla del 70%)
         overlay = np.zeros_like(img, dtype=np.uint8)
@@ -141,7 +139,7 @@ def procesar_campo_visual(image_bytes):
                                           img_heatmap[:,:,c] * (1 - alpha) + overlay[:,:,c] * alpha, 
                                           img_heatmap[:,:,c])
 
-        # Dibujar grilla final
+        # Dibujar grilla final delgada como en tu imagen objetivo
         for i in range(1, 5):
             cv2.circle(img_heatmap, (cx, cy), int(i * pixels_por_10_grados), (0, 0, 255), 1)
         for i in range(8):
@@ -162,7 +160,7 @@ def procesar_campo_visual(image_bytes):
 
 st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
 st.markdown("""
-**Versión Activa:** Grilla Original Restaurada + Regla 70% + Filtro Anti-Marcas.
+**Versión Activa:** Grilla Original Estricta + Reconocimiento de Densidad Total.
 - **Puntos Rojos:** Cuadrados (Fallados).
 - **Puntos Verdes:** Círculos (Vistos).
 - **Celeste:** Densidad ≥ 70% (10°). **Amarillo:** > 0% (5°).
@@ -177,7 +175,7 @@ def mostrar_resultado(columna, titulo, key_uploader):
         st.subheader(titulo)
         file = st.file_uploader(f"Subir imagen {titulo}", type=["jpg", "jpeg", "png"], key=key_uploader)
         if file is not None:
-            with st.spinner("Procesando matriz definitiva..."):
+            with st.spinner("Mapeando y calculando..."):
                 img_res, grados, incap, error_msg = procesar_campo_visual(file.getvalue())
             
             if error_msg:
