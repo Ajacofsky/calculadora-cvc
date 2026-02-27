@@ -8,7 +8,7 @@ import traceback
 st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
 
 # ==========================================
-# MOTOR DE VISIÓN (GRILLA ORIGINAL + DENSIDAD TOTAL)
+# MOTOR DE VISIÓN (GRILLA FIJA + BORRADOR DE ANILLOS)
 # ==========================================
 
 def procesar_campo_visual(image_bytes):
@@ -27,7 +27,7 @@ def procesar_campo_visual(image_bytes):
         # 1. BINARIZACIÓN
         _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
         
-        # 2. CENTRO Y ESCALA (LA GRILLA EXACTA QUE FUNCIONA)
+        # 2. CENTRO Y ESCALA (GRILLA INTACTA)
         mask_ejes = thresh.copy()
         mask_ejes[int(alto*0.75):, :] = 0 # Ocultar tabla inferior
         
@@ -47,19 +47,28 @@ def procesar_campo_visual(image_bytes):
         eje_derecho = lineas_h[cy-5:cy+5, cx:]
         _, x_h = np.where(eje_derecho > 0)
         dist_60 = np.max(x_h) if len(x_h) > 0 else (ancho - cx)*0.75
-        
         pixels_por_10_grados = float(dist_60 / 6.0)
-        margen_eje = pixels_por_10_grados * 0.15 # Filtro para ignorar la cruz central
 
-        # 3. DETECCIÓN (Método de Densidad Total de Caja)
+        # Margen para ignorar marquitas en los ejes (en Humphrey los símbolos nunca tocan los ejes)
+        margen_eje = pixels_por_10_grados * 0.15 
+
+        # 3. DETECCIÓN (Con purga de anillos impresos)
         grilla = cv2.bitwise_or(lineas_h, lineas_v)
         grilla_dilatada = cv2.dilate(grilla, np.ones((3,3), np.uint8))
         
+        # Aislar para encontrar los rectángulos
         simbolos_aislados = cv2.subtract(mask_ejes, grilla_dilatada)
         simbolos_aislados = cv2.morphologyEx(simbolos_aislados, cv2.MORPH_OPEN, np.ones((2,2), np.uint8))
-        
         contornos, _ = cv2.findContours(simbolos_aislados, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        # LA MAGIA: Borrar las líneas circulares para que no "rellenen" los círculos huecos
+        mask_anillos = np.zeros_like(thresh)
+        for i in range(1, 6):
+            cv2.circle(mask_anillos, (cx, cy), int(i * pixels_por_10_grados), 255, 3) # Grosor 3 para barrer la línea
+            
+        thresh_limpio = cv2.subtract(thresh, grilla_dilatada)
+        thresh_limpio = cv2.subtract(thresh_limpio, mask_anillos)
+
         puntos_zona = {a: {o: {'v':0, 'f':0} for o in range(8)} for a in range(4)}
         
         area_min = (ancho * 0.002) ** 2
@@ -74,20 +83,19 @@ def procesar_campo_visual(image_bytes):
                 px, py = x + w//2, y + h//2
                 dx, dy = px - cx, py - cy
                 
-                # Ignorar si está tocando la cruz central (marcas de regla)
+                # FILTRO FANTASMA: Si toca el eje central, se ignora
                 if abs(dx) < margen_eje or abs(dy) < margen_eje:
                     continue
                 
-                # REGLA MAESTRA: Se extrae la caja entera de la imagen original
-                roi = thresh[y:y+h, x:x+w]
+                # Evaluar la densidad en la imagen SIN LÍNEAS IMPRESAS
+                roi = thresh_limpio[y:y+h, x:x+w]
+                densidad_tinta = cv2.countNonZero(roi) / float(w * h)
                 
-                # Si más del 60% de la caja es negra, es un cuadrado macizo. Si es menos, es un círculo hueco.
-                densidad_total = cv2.countNonZero(roi) / float(w * h)
-                tipo = 'fallado' if densidad_total > 0.60 else 'visto'
+                # Un cuadrado cortado sigue teniendo > 45% tinta. Un círculo cortado tiene < 30%.
+                tipo = 'fallado' if densidad_tinta > 0.45 else 'visto'
                 
                 r_deg = (math.hypot(dx, dy) / pixels_por_10_grados) * 10.0
                 
-                # Filtrar a los 40 grados periciales
                 if 1 <= r_deg <= 41:
                     ang = (math.degrees(math.atan2(dy, dx)) + 360.001) % 360
                     anillo = min(3, int(r_deg // 10))
@@ -95,12 +103,10 @@ def procesar_campo_visual(image_bytes):
                     
                     if tipo == 'fallado':
                         puntos_zona[anillo][octante]['f'] += 1
-                        # Puntito rojo pequeño y limpio
-                        cv2.circle(img_heatmap, (px, py), 2, (0, 0, 255), -1)
+                        cv2.circle(img_heatmap, (px, py), 3, (0, 0, 255), -1) # Punto Rojo
                     else:
                         puntos_zona[anillo][octante]['v'] += 1
-                        # Puntito verde pequeño y limpio
-                        cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1)
+                        cv2.circle(img_heatmap, (px, py), 3, (0, 255, 0), -1) # Punto Verde
 
         # 4. PINTURA DE OCTANTES (Regla del 70%)
         overlay = np.zeros_like(img, dtype=np.uint8)
@@ -139,7 +145,7 @@ def procesar_campo_visual(image_bytes):
                                           img_heatmap[:,:,c] * (1 - alpha) + overlay[:,:,c] * alpha, 
                                           img_heatmap[:,:,c])
 
-        # Dibujar grilla final delgada como en tu imagen objetivo
+        # Dibujar grilla final
         for i in range(1, 5):
             cv2.circle(img_heatmap, (cx, cy), int(i * pixels_por_10_grados), (0, 0, 255), 1)
         for i in range(8):
@@ -160,7 +166,7 @@ def procesar_campo_visual(image_bytes):
 
 st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
 st.markdown("""
-**Versión Activa:** Grilla Original Estricta + Reconocimiento de Densidad Total.
+**Versión Activa:** Grilla Original Estricta + Borrador de Líneas (Filtro Amarillo).
 - **Puntos Rojos:** Cuadrados (Fallados).
 - **Puntos Verdes:** Círculos (Vistos).
 - **Celeste:** Densidad ≥ 70% (10°). **Amarillo:** > 0% (5°).
@@ -175,7 +181,7 @@ def mostrar_resultado(columna, titulo, key_uploader):
         st.subheader(titulo)
         file = st.file_uploader(f"Subir imagen {titulo}", type=["jpg", "jpeg", "png"], key=key_uploader)
         if file is not None:
-            with st.spinner("Mapeando y calculando..."):
+            with st.spinner("Limpiando ruido y calculando áreas..."):
                 img_res, grados, incap, error_msg = procesar_campo_visual(file.getvalue())
             
             if error_msg:
