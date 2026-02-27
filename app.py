@@ -106,24 +106,4 @@ def procesar_campo_visual(image_bytes):
         grados_no_vistos_total = 0
         
         for i in range(1, 5):
-            radio_dibujo = int(i * pixels_por_10_grados)
-            cv2.circle(img_heatmap, (cx, cy), radio_dibujo, (0, 0, 255), 1)
-            
-        for anillo in range(4):
-            limite_inf = anillo * 10
-            limite_sup = (anillo + 1) * 10
-            
-            for octante in range(8):
-                ang_inf = octante * 45
-                ang_sup = (octante + 1) * 45
-                
-                puntos_zona = [p for p in puntos_totales if limite_inf <= p['r'] < limite_sup and ang_inf <= p['ang'] < ang_sup]
-                
-                total_pts = len(puntos_zona)
-                fallados = sum(1 for p in puntos_zona if p['tipo'] == 'fallado')
-                
-                color_zona = None
-                grados_perdidos = 0
-                
-                if total_pts > 0:
-                    densidad = (fallados / total_pts) *
+            radio_dibujo = int(i * pixels
