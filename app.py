@@ -20,17 +20,18 @@ def procesar_campo_visual(image_bytes):
 
     img_heatmap = img.copy()
     overlay = img.copy()
+    
+    # Conservamos la imagen en grises ORIGINAL e INTACTA para medir la luz
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     alto, ancho = gray.shape
     
-    # Binarización automática (OTSU) para adaptar el contraste
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Binarización solo usada como "radar" para encontrar coordenadas
+    _, thresh_radar = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
     # --- A. CALIBRACIÓN GEOMÉTRICA BLINDADA ---
-    # Enmascaramos el 25% inferior para que la tabla no confunda a los ejes
-    mask_ejes = thresh.copy()
+    mask_ejes = thresh_radar.copy()
     limite_inferior = int(alto * 0.75)
-    mask_ejes[limite_inferior:, :] = 0 
+    mask_ejes[limite_inferior:, :] = 0 # Ocultar la tabla inferior
     
     kernel_h_axis = cv2.getStructuringElement(cv2.MORPH_RECT, (int(ancho * 0.2), 1))
     lineas_h = cv2.morphologyEx(mask_ejes, cv2.MORPH_OPEN, kernel_h_axis)
@@ -55,10 +56,10 @@ def procesar_campo_visual(image_bytes):
         dist_60 = int((ancho - cx) * 0.75)
         pixels_por_10_grados = dist_60 / 6.0
     
-    # --- B. DETECCIÓN DE SÍMBOLOS CON EVALUACIÓN EN IMAGEN ORIGINAL ---
+    # --- B. DETECCIÓN POR ANÁLISIS FOTOMÉTRICO (LA OPCIÓN SUPERIOR) ---
     
-    # Restamos las líneas SOLO para encontrar las coordenadas sin que se peguen los símbolos
-    thresh_sin_ejes = cv2.subtract(thresh, cv2.bitwise_or(lineas_h, lineas_v))
+    # Restamos las líneas de los ejes del "radar"
+    thresh_sin_ejes = cv2.subtract(thresh_radar, cv2.bitwise_or(lineas_h, lineas_v))
     contornos, _ = cv2.findContours(thresh_sin_ejes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     puntos_totales = []
     
@@ -69,37 +70,44 @@ def procesar_campo_visual(image_bytes):
         area_caja = w * h
         aspect_ratio = float(w)/h if h > 0 else 0
         
+        # Si la caja tiene tamaño de símbolo...
         if 8 < area_caja < max_area_esperada and 0.4 < aspect_ratio < 2.5:
             
-            # MAGIA: Evaluamos el contenido mirando la imagen ORIGINAL (thresh)
-            roi_original = thresh[y:y+h, x:x+w]
-            pixeles_tinta = cv2.countNonZero(roi_original)
-            indice_relleno = pixeles_tinta / float(area_caja)
+            # --- ANÁLISIS DE LUZ EN LA IMAGEN ORIGINAL ---
+            # Recortamos el símbolo en la imagen gris real (sin modificaciones)
+            roi_gris_real = gray[y:y+h, x:x+w]
             
-            # Test Morfológico de Grosor (Lijado)
-            kernel_size = max(2, int(min(w, h) * 0.3))
-            kernel_test = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-            roi_eroded = cv2.erode(roi_original, kernel_test, iterations=1)
-            es_macizo = cv2.countNonZero(roi_eroded) > 0
+            # Apuntamos exactamente al núcleo (el centro matemático del símbolo)
+            # Evitamos los bordes donde el círculo tiene tinta negra
+            nucleo_y1, nucleo_y2 = int(h * 0.35), int(h * 0.65)
+            nucleo_x1, nucleo_x2 = int(w * 0.35), int(w * 0.65)
             
-            px, py = x + w//2, y + h//2
-            dx, dy = px - cx, py - cy
-            radio_pixel = math.hypot(dx, dy)
-            grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
-            
-            if 2 < grados_fisicos <= 41:
-                angulo = math.degrees(math.atan2(dy, dx))
-                if angulo < 0: angulo += 360
+            if nucleo_y2 > nucleo_y1 and nucleo_x2 > nucleo_x1:
+                nucleo = roi_gris_real[nucleo_y1:nucleo_y2, nucleo_x1:nucleo_x2]
                 
-                # REGLA DE ORO ACTUALIZADA
-                if indice_relleno > 0.55 or es_macizo: 
-                    tipo = 'fallado'
-                    cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo
-                else:                     
-                    tipo = 'visto'
-                    cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde
+                # Medimos la luz promedio del núcleo (0 es negro puro, 255 es blanco puro)
+                luz_promedio = np.mean(nucleo)
+                
+                px, py = x + w//2, y + h//2
+                dx, dy = px - cx, py - cy
+                radio_pixel = math.hypot(dx, dy)
+                grados_fisicos = (radio_pixel / pixels_por_10_grados) * 10
+                
+                if 2 < grados_fisicos <= 41:
+                    angulo = math.degrees(math.atan2(dy, dx))
+                    if angulo < 0: angulo += 360
                     
-                puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
+                    # REGLA FOTOMÉTRICA INQUEBRANTABLE:
+                    # Si la luz es menor a 130 (zona oscura/tinta), es un Cuadrado.
+                    if luz_promedio < 130: 
+                        tipo = 'fallado'
+                        cv2.circle(img_heatmap, (px, py), 4, (0, 0, 255), -1) # Punto Rojo
+                    else:                     
+                        # Si es mayor (refleja el papel blanco), es un Círculo.
+                        tipo = 'visto'
+                        cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1) # Punto Verde
+                        
+                    puntos_totales.append({'r': grados_fisicos, 'ang': angulo, 'tipo': tipo})
 
     # --- C. ANÁLISIS POR ZONAS Y MAPA DE CALOR ---
     grados_no_vistos_total = 0
