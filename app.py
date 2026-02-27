@@ -8,7 +8,7 @@ import traceback
 st.set_page_config(page_title="Calculadora Pericial de CVC", layout="wide")
 
 # ==========================================
-# MOTOR DE VISIÓN (MOTOR ORO ORIGINAL)
+# MOTOR DE VISIÓN (MOTOR ORO + FILTRO FANTASMA)
 # ==========================================
 
 def procesar_campo_visual(image_bytes):
@@ -24,10 +24,10 @@ def procesar_campo_visual(image_bytes):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         alto, ancho = gray.shape
         
-        # 1. BINARIZACIÓN BÁSICA Y SÓLIDA
+        # 1. BINARIZACIÓN
         _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
         
-        # 2. CENTRO Y ESCALA (MÉTODO ORO: Cruce Morfológico)
+        # 2. CENTRO Y ESCALA
         mask_ejes = thresh.copy()
         mask_ejes[int(alto*0.75):, :] = 0 # Ocultar tabla inferior
         
@@ -49,10 +49,10 @@ def procesar_campo_visual(image_bytes):
         dist_60 = np.max(x_h) if len(x_h) > 0 else (ancho - cx)*0.75
         pixels_por_10_grados = float(dist_60 / 6.0)
 
-        # MAGIA NUEVA: Margen para ignorar las marcas de la regla (Ticks)
+        # Margen físico para ignorar la cruz y sus marquitas
         margen_eje = pixels_por_10_grados * 0.15
 
-        # 3. DETECCIÓN (MÉTODO ORO: Núcleo del 40%)
+        # 3. DETECCIÓN (Motor Original Restaurado a Dinámico)
         grilla = cv2.bitwise_or(lineas_h, lineas_v)
         grilla_dilatada = cv2.dilate(grilla, np.ones((3,3), np.uint8))
         
@@ -63,14 +63,20 @@ def procesar_campo_visual(image_bytes):
         
         puntos_zona = {a: {o: {'v':0, 'f':0} for o in range(8)} for a in range(4)}
         
-        area_min, area_max = 8, 400
+        # ERROR CORREGIDO AQUÍ: Volvemos al cálculo de tamaño adaptativo (no fijo a 400)
+        area_min = (ancho * 0.002) ** 2
+        area_max = (ancho * 0.025) ** 2
+        
         for cnt in contornos:
             x, y, w, h = cv2.boundingRect(cnt)
-            if area_min < w*h < area_max and 0.4 < w/float(h) < 2.5:
+            area = w * h
+            aspect_ratio = w / float(h) if h > 0 else 0
+            
+            if area_min < area < area_max and 0.4 < aspect_ratio < 2.5:
                 px, py = x + w//2, y + h//2
                 dx, dy = px - cx, py - cy
                 
-                # FILTRO FANTASMA: Si toca la cruz, lo ignoramos (es una marca o la mancha ciega)
+                # FILTRO FANTASMA: Si toca el eje central, se ignora
                 if abs(dx) < margen_eje or abs(dy) < margen_eje:
                     continue
                 
@@ -86,7 +92,6 @@ def procesar_campo_visual(image_bytes):
                     r_deg = (math.hypot(dx, dy) / pixels_por_10_grados) * 10.0
                     
                     if 2 <= r_deg <= 41:
-                        # Sumamos 0.001 para que los puntos en diagonal no cambien de octante al azar
                         ang = (math.degrees(math.atan2(dy, dx)) + 360.001) % 360
                         anillo = min(3, int(r_deg // 10))
                         octante = min(7, int(ang // 45))
@@ -98,7 +103,7 @@ def procesar_campo_visual(image_bytes):
                             puntos_zona[anillo][octante]['v'] += 1
                             cv2.circle(img_heatmap, (px, py), 2, (0, 255, 0), -1)
 
-        # 4. PINTURA DE OCTANTES (Regla 70%)
+        # 4. PINTURA DE OCTANTES
         overlay = np.zeros_like(img, dtype=np.uint8)
         grados_no_vistos = 0
         
@@ -128,7 +133,6 @@ def procesar_campo_visual(image_bytes):
                             cv2.ellipse(mask, (cx, cy), (r_in, r_in), 0, ang_in, ang_out, 0, -1)
                         overlay[mask == 255] = color
 
-        # Fusión Transparente
         gray_mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
         alpha = 0.5
         for c in range(3):
@@ -136,7 +140,7 @@ def procesar_campo_visual(image_bytes):
                                           img_heatmap[:,:,c] * (1 - alpha) + overlay[:,:,c] * alpha, 
                                           img_heatmap[:,:,c])
 
-        # Dibujar grilla final roja
+        # Dibujar grilla final
         for i in range(1, 5):
             cv2.circle(img_heatmap, (cx, cy), int(i * pixels_por_10_grados), (0, 0, 255), 1)
         for i in range(8):
@@ -157,7 +161,7 @@ def procesar_campo_visual(image_bytes):
 
 st.title("👁️ Evaluación Legal de Campo Visual Computarizado")
 st.markdown("""
-**Programa Activo:** Motor Original + Grilla Fija + **Filtro Anti-Marcas**.
+**Versión Activa:** Filtro Fantasma + Detección Dinámica Restaurada.
 - **Puntos Rojos:** Cuadrados (Fallados).
 - **Puntos Verdes:** Círculos (Vistos).
 - **Celeste:** Densidad ≥ 70% (10°). **Amarillo:** > 0% (5°).
@@ -172,7 +176,7 @@ def mostrar_resultado(columna, titulo, key_uploader):
         st.subheader(titulo)
         file = st.file_uploader(f"Subir imagen {titulo}", type=["jpg", "jpeg", "png"], key=key_uploader)
         if file is not None:
-            with st.spinner("Procesando auditoría..."):
+            with st.spinner("Procesando matriz definitiva..."):
                 img_res, grados, incap, error_msg = procesar_campo_visual(file.getvalue())
             
             if error_msg:
@@ -181,31 +185,4 @@ def mostrar_resultado(columna, titulo, key_uploader):
                 return 0.0
             elif img_res is not None:
                 img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
-                st.image(Image.fromarray(img_rgb), caption=f"Mapa de Calor Clínico - {titulo}", use_container_width=True)
-                st.success(f"**Grados No Vistos:** {grados}° / 320°")
-                st.metric(label=f"Incapacidad {titulo}", value=f"{incap:.2f}%")
-                return incap
-            else:
-                st.error("Error desconocido.")
-    return 0.0
-
-incap_OD = mostrar_resultado(col1, "Ojo Derecho (OD)", "od_file")
-incap_OI = 0.0
-
-if modo_evaluacion == "Bilateral (Ambos ojos)":
-    incap_OI = mostrar_resultado(col2, "Ojo Izquierdo (OI)", "oi_file")
-
-st.divider()
-st.header("📊 Informe Final de Incapacidad Visual")
-
-if modo_evaluacion == "Bilateral (Ambos ojos)":
-    if incap_OD > 0 and incap_OI > 0:
-        suma_aritmetica = incap_OD + incap_OI
-        incapacidad_bilateral = suma_aritmetica * 1.5
-        
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Suma Aritmética", f"{suma_aritmetica:.2f}%")
-        col_b.metric("Factor Bilateralidad", "x 1.5")
-        col_c.metric("Incapacidad Total", f"{incapacidad_bilateral:.2f}%", delta="Final Legal")
-    else:
-        st.info("Suba ambas imágenes para el cálculo bilateral.")
+                st.image(Image.fromarray(img_rgb), caption=f"Mapa de Calor -
